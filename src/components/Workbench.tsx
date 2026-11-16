@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { applySilenceGate, computeMetrics } from '../audio/dsp';
 import { HIGHPASS_HZ, isFfmpegLoaded, processWithFfmpeg } from '../audio/ffmpegEngine';
+import { playableSides } from '../audio/playback';
 import { abGains, integratedLoudness } from '../audio/loudness';
 import { decodeBlob } from '../audio/capture';
 import { getRecordingAudio, getRecordingMeta, updateRecordingMeta } from '../audio/db';
@@ -116,7 +117,8 @@ export default function Workbench(props: {
       setProgress(0);
       setEngineError('');
       // wasm 懒加载：只在用户打开工作台、第一次真正降噪时加载；
-      // 核心跑在 ffmpeg.wasm 自带的 Worker 里，不卡 UI。
+      // 单线程 core-st 跑在调用线程上（不起 worker），长歌处理期间主线程
+      // 会被占住，进度条可能跳变——已知限制，见 PROGRESS.md。
       if (!isFfmpegLoaded()) setEngineStatus('loading');
       try {
         const { channels: out, sampleRate: outRate } = await processWithFfmpeg(ch, sr, {
@@ -203,46 +205,62 @@ export default function Workbench(props: {
     return offsetRef.current;
   }
 
+  /**
+   * 播放解耦（v3）：哪边有 buffer 就播哪边；请求的一侧不存在时退到另一侧，
+   * 两侧都不存在才返回。原声永不因降噪失败而被堵住——引擎失败时 processed
+   * 恒为 null，但原声照常播。
+   */
   function startBoth(offset: number, side: Exclude<PlayingSide, null>): void {
     const ctx = ensureCtx();
-    if (!origBufRef.current && channels) {
-      origBufRef.current = makeBuffer(ctx, channels, sampleRate);
-    }
-    if (!procBufRef.current && processed) {
-      procBufRef.current = makeBuffer(ctx, processed, sampleRate);
-    }
-    if (!origBufRef.current || !procBufRef.current) return;
+    const origBuf = origBufRef.current ?? (channels ? makeBuffer(ctx, channels, sampleRate) : null);
+    if (origBuf) origBufRef.current = origBuf;
+    const procBuf = procBufRef.current ?? (processed ? makeBuffer(ctx, processed, sampleRate) : null);
+    if (procBuf) procBufRef.current = procBuf;
+    const avail = { orig: origBuf !== null, proc: procBuf !== null };
+    const effectiveSide: PlayingSide = avail[side]
+      ? side
+      : avail.orig
+        ? 'orig'
+        : avail.proc
+          ? 'proc'
+          : null;
+    if (!effectiveSide) return;
     stopSources();
-    if (!gainOrigRef.current) {
-      gainOrigRef.current = ctx.createGain();
-      gainOrigRef.current.connect(ctx.destination);
-    }
-    if (!gainProcRef.current) {
-      gainProcRef.current = ctx.createGain();
-      gainProcRef.current.connect(ctx.destination);
-    }
     const g = ab ?? { gainOriginalDb: 0, gainProcessedDb: 0, diffLu: 0 };
-    gainOrigRef.current.gain.setValueAtTime(
-      side === 'orig' ? Math.pow(10, g.gainOriginalDb / 20) : 0,
-      ctx.currentTime,
-    );
-    gainProcRef.current.gain.setValueAtTime(
-      side === 'proc' ? Math.pow(10, g.gainProcessedDb / 20) : 0,
-      ctx.currentTime,
-    );
-    const srcO = ctx.createBufferSource();
-    srcO.buffer = origBufRef.current;
-    srcO.connect(gainOrigRef.current);
-    const srcP = ctx.createBufferSource();
-    srcP.buffer = procBufRef.current;
-    srcP.connect(gainProcRef.current);
-    srcO.start(0, offset);
-    srcP.start(0, offset);
-    sourcesRef.current = [srcO, srcP];
+    if (origBuf) {
+      if (!gainOrigRef.current) {
+        gainOrigRef.current = ctx.createGain();
+        gainOrigRef.current.connect(ctx.destination);
+      }
+      gainOrigRef.current.gain.setValueAtTime(
+        effectiveSide === 'orig' ? Math.pow(10, g.gainOriginalDb / 20) : 0,
+        ctx.currentTime,
+      );
+      const srcO = ctx.createBufferSource();
+      srcO.buffer = origBuf;
+      srcO.connect(gainOrigRef.current);
+      srcO.start(0, offset);
+      sourcesRef.current.push(srcO);
+    }
+    if (procBuf) {
+      if (!gainProcRef.current) {
+        gainProcRef.current = ctx.createGain();
+        gainProcRef.current.connect(ctx.destination);
+      }
+      gainProcRef.current.gain.setValueAtTime(
+        effectiveSide === 'proc' ? Math.pow(10, g.gainProcessedDb / 20) : 0,
+        ctx.currentTime,
+      );
+      const srcP = ctx.createBufferSource();
+      srcP.buffer = procBuf;
+      srcP.connect(gainProcRef.current);
+      srcP.start(0, offset);
+      sourcesRef.current.push(srcP);
+    }
     startedAtRef.current = ctx.currentTime;
     offsetRef.current = offset;
-    playingRef.current = side;
-    setPlaying(side);
+    playingRef.current = effectiveSide;
+    setPlaying(effectiveSide);
     setPlayOffset(offset);
   }
 
@@ -257,28 +275,36 @@ export default function Workbench(props: {
       setPlayOffset(offsetRef.current);
       return;
     }
-    startBoth(offsetRef.current, 'proc');
+    // 默认走原声：降噪后不存在时也照常播。
+    startBoth(offsetRef.current, 'orig');
   }
 
   function switchSide(side: Exclude<PlayingSide, null>): void {
+    // 切到不存在的一侧：什么都不做，不许杀掉正在播的原声。
+    if (side === 'proc' && !processed) return;
     const ctx = ctxRef.current;
-    if (!ctx || !playingRef.current || !gainOrigRef.current || !gainProcRef.current) {
+    if (!ctx || !playingRef.current) {
       startBoth(offsetRef.current, side);
       return;
     }
+    // 已在播放：只调已存在的增益节点；不存在的一侧没有源在跑，直接跳过。
     const offset = currentOffset();
     const g = ab ?? { gainOriginalDb: 0, gainProcessedDb: 0, diffLu: 0 };
     const t = ctx.currentTime;
-    gainOrigRef.current.gain.setTargetAtTime(
-      side === 'orig' ? Math.pow(10, g.gainOriginalDb / 20) : 0,
-      t,
-      0.005,
-    );
-    gainProcRef.current.gain.setTargetAtTime(
-      side === 'proc' ? Math.pow(10, g.gainProcessedDb / 20) : 0,
-      t,
-      0.005,
-    );
+    if (gainOrigRef.current) {
+      gainOrigRef.current.gain.setTargetAtTime(
+        side === 'orig' ? Math.pow(10, g.gainOriginalDb / 20) : 0,
+        t,
+        0.005,
+      );
+    }
+    if (gainProcRef.current) {
+      gainProcRef.current.gain.setTargetAtTime(
+        side === 'proc' ? Math.pow(10, g.gainProcessedDb / 20) : 0,
+        t,
+        0.005,
+      );
+    }
     offsetRef.current = offset;
     startedAtRef.current = t;
     playingRef.current = side;
@@ -383,6 +409,9 @@ export default function Workbench(props: {
     );
   }
 
+  // 哪几侧可播：原声永远可播；降噪后只有 processed 存在时可播。
+  const sides = playableSides(processed !== null);
+
   return (
     <div>
       <section className="card" aria-label="当前录音">
@@ -467,6 +496,8 @@ export default function Workbench(props: {
             type="button"
             className="ghost"
             aria-pressed={playing === 'proc'}
+            disabled={!sides.proc}
+            title={sides.proc ? undefined : '降噪后暂不可用：引擎尚未成功运行'}
             onClick={() => {
               if (playing === 'proc') void togglePlay();
               else if (playing) switchSide('proc');
@@ -483,6 +514,14 @@ export default function Workbench(props: {
             {copy.workbench.sameVolumeNote}
           </span>
         </div>
+        {!sides.proc && engineStatus === 'error' && (
+          <p className="error" role="status">
+            降噪后暂不可用（引擎加载失败，见上方错误），原声仍可正常播放。
+          </p>
+        )}
+        {!sides.proc && !processing && engineStatus !== 'error' && engineStatus !== 'ready' && (
+          <p className="muted">降噪后待引擎就绪后可用，原声可先播放。</p>
+        )}
         <label htmlFor="seek">播放位置</label>
         <input
           id="seek"

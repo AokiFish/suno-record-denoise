@@ -1,8 +1,8 @@
 /**
- * v2 真歌验收：wasm 线（ffmpeg.wasm 0.11.6 + core 0.11.0，Node 里经
- * require('@ffmpeg/core') 加载同一份 core 代码）。
+ * v3 真歌验收：wasm 线（ffmpeg.wasm 0.11.6 + @ffmpeg/core-st@0.11.1，Node 里经
+ * require('@ffmpeg/core-st') 加载同一份 core 代码）。
  *
- * Node 环境说明：0.11.0 的 Emscripten core 在 Node 里仍用 fetch 取 .wasm，
+ * Node 环境说明：core-st 的 Emscripten core 在 Node 里仍用 fetch 取 .wasm，
  * 但传的是裸文件路径（不是 URL），Node 原生 fetch 会报 Invalid URL。
  * 下面的 fetch 垫片只拦截裸路径输入、用 fs 读盘并包成 application/wasm
  * 的 Response，其余 fetch 原样透传；它只解决 Node 取文件的问题，
@@ -52,7 +52,7 @@ describe('真歌 afftdn（wasm 线）', () => {
     const { channels: outChannels, sampleRate: outRate } = await processWithFfmpeg(
       fixture.data,
       SR,
-      { strength: 0.5, corePath: '@ffmpeg/core' },
+      { strength: 0.5, corePath: '@ffmpeg/core-st' },
     );
     const elapsedSec = (Date.now() - t0) / 1000;
     expect(outRate).toBe(44100);
@@ -95,7 +95,7 @@ describe('真歌 afftdn（wasm 线）', () => {
       join(OUT, 'real-song-wasm-metrics.json'),
       JSON.stringify(
         {
-          engine: 'ffmpeg.wasm 0.11.6 + @ffmpeg/core 0.11.0 (Node require)',
+          engine: 'ffmpeg.wasm 0.11.6 + @ffmpeg/core-st 0.11.1 (Node require)',
           chain: 'highpass=f=90,afftdn=nr=12:nf=-30',
           elapsedSec: Number(elapsedSec.toFixed(1)),
           outputSamples: n,
@@ -115,5 +115,24 @@ describe('真歌 afftdn（wasm 线）', () => {
         2,
       ),
     );
+  }, 300000);
+
+  it('core-st 连续跑两次都成功（单次运行，第二次自动重载）', async () => {
+    // 回归测试：core-st 实例 main 返回后 runtime 退出，同一实例第二次
+    // run 会报 Program terminated with exit(0)。processWithFfmpeg 跑完
+    // 即丢弃实例，下次调用重新加载——两次都要成功（工作台 400 ms 防抖
+    // 重算就靠这个，强度滑块一拖就重跑）。
+    const ch = new Float32Array(SR);
+    for (let i = 0; i < SR; i++) ch[i] = Math.sin((2 * Math.PI * 440 * i) / SR) * 0.2;
+    const input: Float32Array[] = [ch, ch.slice()];
+    for (let run = 1; run <= 2; run++) {
+      const { channels: out } = await processWithFfmpeg(input, SR, {
+        strength: 0.5,
+        corePath: '@ffmpeg/core-st',
+      });
+      expect(out[0].length).toBeGreaterThan(SR - 4096);
+      expect(out[0].length).toBeLessThanOrEqual(SR);
+      console.log(`连续跑第 ${run} 次：输出 ${out[0].length} 采样`);
+    }
   }, 300000);
 });

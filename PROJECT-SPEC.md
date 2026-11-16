@@ -28,8 +28,8 @@
 
 - 前端：TypeScript + React + Vite（版本贴 Audio Lab 已锁定的稳定线：React 19.3.1、Vite 7.3.8、TypeScript 5.9.3），纯 CSS（CSS 变量），不引入 UI 组件库。
 - 录制：`getDisplayMedia({ video: true, audio: true })`，只取音频轨；`MediaRecorder`（WebM/Opus）→ 解码 → 转 WAV 入库。麦克风入口（`getUserMedia`，降噪/回声消除/自动增益三开关）与上传入口（wav/mp3/flac/m4a，≤80 MB/10 分钟）保留。
-- 降噪（v2，2026-11-16 改）：FFmpeg `afftdn`（ffmpeg.wasm 单线程版，`@ffmpeg/ffmpeg@0.11.6` + `@ffmpeg/core@0.11.0`，钉死不升 0.12.x）+ 90 Hz 高通；滤镜串 `highpass=f=90,afftdn=nr=X:nf=Y`，强度滑块 0–100% 默认 50%（→ `nr=12:nf=-30`），强度 0 = 只做高通；不用 `sn` 采样（出货核心上不达标，见 §7），不框选噪声段；静音门默认关（开时只在全频段 RMS < −60 dBFS 的段动作，淡入淡出 50 ms）。v1 手写谱减法已删除，不留作备选；wasm 加载失败如实报错。
-- 对比与指标：同响度 A/B（切换播放位置不变，响度差 <0.2 LU，默认先播处理后）；显示噪声底、信噪比变化、频谱距离、真峰值、削波数；静音段处理后仍 <-50 dBFS（开头 100 ms 不计）。
+- 降噪（v3，2026-11-16 改）：FFmpeg `afftdn`（ffmpeg.wasm 官方单线程版，`@ffmpeg/ffmpeg@0.11.6` + `@ffmpeg/core-st@0.11.1`，钉死不升 0.12.x）+ 90 Hz 高通；滤镜串 `highpass=f=90,afftdn=nr=X:nf=Y`，强度滑块 0–100% 默认 50%（→ `nr=12:nf=-30`），强度 0 = 只做高通；不用 `sn` 采样（出货核心上不达标，见 §7），不框选噪声段；静音门默认关（开时只在全频段 RMS < −60 dBFS 的段动作，淡入淡出 50 ms）。v1 手写谱减法已删除，不留作备选；wasm 加载失败如实报错。正名（v3）：v2 用的 `@ffmpeg/core@0.11.0` 是多线程版、不是单线程版，v2 简报的说法是错的，见 §8。
+- 对比与指标：同响度 A/B（切换播放位置不变，响度差 <0.2 LU，默认先播原声）；显示噪声底、信噪比变化、频谱距离、真峰值、削波数；静音段处理后仍 <-50 dBFS（开头 100 ms 不计）。播放与降噪解耦（v3）：原声永远可播，降噪后只有 processed 存在时可播；降噪引擎失败时降噪后按钮禁用 + 看得见的状态，不许悄悄没反应；切到不存在的一侧不许杀掉正在播的原声。
 - 导出：浏览器内编码 WAV（44.1 kHz）下载；附 denoise-report.json（强度、SNR 前后、真峰值、警告）。
 - 存储：首版 IndexedDB（录音 + 设置 + 指标），零服务端、零环境变量。Workers/R2 跨设备同步是第二步，不写进首版、不留假接口。
 - 部署：Cloudflare Pages。`package.json` 有 `build`（`tsc && vite build`）与 `preview`；根目录 `README.md` 写清 Luca 的部署步骤（Cloudflare Dashboard → Pages → 连接 GitHub 仓 → 构建命令 `npm run build`、输出目录 `dist`）；不写需要他配 R2/KV/D1 的步骤。
@@ -67,10 +67,34 @@
 - `sn` 噪声采样：出货核心（wasm 5.1 系）上采样链最好成绩 brilliance 只降 5.10 dB（`nf` 已到上限 −20），达不到 ≥6 dB 验收线；且采样把低频段推过线。采样谱形在 wasm 与 CLI 上完全不同（CLI 峰 +14 dB@270 Hz，wasm 高频段压到 −24 限幅），源码相同、构建层差异。改用默认白噪声谱形，不采样。
 - LR4 分频（250 Hz 以下直通）：分频重构本身让低频段动 −2.40 dB，比不分频的 −0.62 dB 更差。低频保护改由 `nf=−30` 上限保证。
 - `bn` 自定义低频保护：采样会覆盖 `bn`（源码 `set_noise_profile` 直接 memcpy）；在不采样链上 `bn` 与默认谱形结果完全相同（冗余）。
-- 0.12.x 多线程 wasm core：任务钉死 0.11.6/0.11.0，勿升；多线程要 SharedArrayBuffer + COOP/COEP，单线程不用。
+- 0.12.x 多线程 wasm core：任务钉死 0.11.6/0.11.1（core-st），勿升；多线程要 SharedArrayBuffer + COOP/COEP，单线程不用。
 
 **录制修复**：`MediaRecorder` 加 `audioBitsPerSecond: 192000`；页面加前台警告（Suno 标签页与本站标签页都要保持前台，切后台会被 Chrome 节流造成断点）；录音元数据记 chunk 数与总字节数（250 ms 一 chunk，60 秒应有约 240 个，供断点定位）；timeslice 保持 250 ms。
 
 **v2 验收（替代 §6 第 2 条的合成音引擎测试）**：真歌 fixture（贝多芬《月光奏鸣曲》第一乐章，Wikimedia Commons CC BY-SA 4.0，42 秒，加粉红噪声至 20.00 dB SNR）双线实测——CLI ffmpeg 8.1 与 wasm 核心出货链（`highpass=f=90,afftdn=nr=12:nf=-30`）都通过：噪声频段（brillance 5–10 kHz）降 ≥6 dB、低频段（20–250 Hz 合并绝对电平）变化 <1 dB、中频段（500–2000 Hz）变化 <1 dB、无新增削波、静音段 <−50 dBFS。完整指标表见 PROGRESS.md。合成音测试保留为测量辅助与静音门测试（`tests/dsp.test.ts`，18/18 通过）；原验收里的“掩码平滑测试（相邻帧掩码变化有界）”不适用——afftdn 的掩码/平滑在 libavfilter 内部，没有 JS 掩码可测，改为滤镜串构造测试（锚点、插值、不含 `sn` 采样断言）+ 真歌双线指标表。
 
 **已知偏差（报给父代理）**：同一份 afftdn 源码在 wasm 核心与本机 ffmpeg 8.1 上 `nf` 标定差约 20 dB（wasm `nf=−30` ≈ CLI `nf=−50`），出货链在 wasm 核心上标定、CLI 只作交叉对照；“本机真 ffmpeg（同款 libavfilter 代码）先验证”的前提在实践中不成立，验收数字以 wasm 线为准。低频段验收口径为 20–250 Hz 合并绝对电平（90 Hz 高通单独就让 sub 20–60 Hz 相对电平动 −15.66 dB，sub 单独算永远过不了线，见 PROGRESS.md）。
+
+## 8. v3 修复（2026-11-16，Luca 真机报 bug 后）
+
+**起因**：v2 上线后 Luca 真机报两个 bug——① 打开工作台降噪报“降噪引擎加载失败：SharedArrayBuffer is not defined”；② 录制的歌完全没法播放（连原声都播不了）。
+
+**根因 1（引擎）**：v2 用的 `@ffmpeg/core@0.11.0` 是多线程版，不是单线程版。它的 JS 里有 4 处 SharedArrayBuffer 引用；SharedArrayBuffer 只在 COOP/COEP 跨域隔离下才存在，Cloudflare Pages 默认不发这两个头，无隔离的页面里根本没有这个对象，引擎一加载就炸。Node 自带 SharedArrayBuffer，所以 v2 的全部 Node 测试都过了、真机才炸——v2 的漏验。v2 简报里“core 0.11.0 是单线程版”的说法是错的，以本节为准正名。
+
+**根因 2（播放门）**：`src/components/Workbench.tsx` 的 `startBoth()` 在 `origBufRef.current` 与 `procBufRef.current` 有一个不存在时就直接 return；`procBufRef` 只在降噪成功后才有；引擎一失败 → `processed` 恒为 null → `startBoth` 直接返回 → 原声也播不了。v1 的手写 DSP 是同步的、总能成功，所以这个门一直潜伏着；v2 引擎一失败就变成永久性的。
+
+**修复**：
+- 引擎换官方单线程版 `@ffmpeg/core-st@0.11.1`（钉死，不许用 ^ 浮动；`@ffmpeg/core@0.11.0` 只留 devDependencies 供 SAB 回归测试当反例，永不打包进应用）。core-st 的 JS 里 0 次出现 SharedArrayBuffer。两处工程细节（都实测过）：① 它只导出 `_main` 不导出 `_proxy_main`，加载时必须传 `mainName: 'main'`；② 实例是单次运行的（main 返回后 runtime 退出，同一实例第二次 run 报 `Program terminated with exit(0)`），`processWithFfmpeg` 每次跑完即丢弃实例、下次调用重新加载。
+- 播放与降噪解耦：`startBoth` 不许再因为缺一边就整体 return——有哪边播哪边；`processed` 为 null 时只播原声，`togglePlay` 默认走原声；降噪后那一侧在 `processed` 为 null 时按钮禁用 + 看得见的状态；切到不存在的一侧不许杀掉正在播的原声。两边都有时同响度 A/B 行为不变。400 ms 防抖自动重算与引擎失败如实报错保留。
+- `src/components/Library.tsx` 不许动（v1 原样，无证据表明它坏了）。
+
+**v3 验收（在 §6/§7 基础上追加）**：
+- SAB 删除测试（`tests/sab.test.ts`）：Node 里删掉 `globalThis.SharedArrayBuffer` 后旧 MT core 加载失败、core-st 加载成功并在真歌 fixture 上跑通出货链，指标过线。
+- core-st 真歌指标全量重跑（`tests/out/real-song-wasm-metrics.json`）：与 v2 的 MT core 数逐值相同（brillance −7.15、air −11.11、低频 −0.56、中频 −0.01、无削波、静音 −69.97 dBFS），强度映射表（nr 6/12/20/30、nf −30）四锚点重测与 v2 数相差 ≤0.03 dB（舍入级），映射不变。
+- 连续跑两次测试（`tests/real-song-wasm.test.ts`）：同一 `processWithFfmpeg` 接口连续跑两次都成功（第二次自动重载实例）。
+- 播放门测试（`tests/playback.test.ts`）：`playableSides(false)` → 原声可播、降噪后不可播；`playableSides(true)` → 两侧可播。
+- `rm -rf public/ffmpeg && npm install --legacy-peer-deps && npm run build` 后 `dist/ffmpeg/` 齐全（postinstall 从 core-st 生成）。
+
+**被否掉的方案**：多线程 core + Pages `_headers` 发 COOP/COEP——能行，但要动隔离头（COEP 会要求所有子资源带 CORP，牵连面大），而 core-st 同数零配置，更简单；0.12.x——钉死 0.11 线，无收益；全局 `Module.noExitRuntime`——实测救不了单次运行问题（探针：第二跑照样 exit(0)）；绕过 `@ffmpeg/ffmpeg` 直接调 core 工厂——改动大，没必要（重载实例已够用）。
+
+**未验项（sandbox-only，留给 Luca 真机）**：真浏览器里的 core-st 加载与降噪；真机播放（原声可播、降噪后可用、A/B 切换）；单线程跑在主线程上，长歌降噪时进度条可能跳变（已知限制，外观级）。

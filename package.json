@@ -1,12 +1,13 @@
 {
   "dependencies": {
-    "@ffmpeg/core": "^0.11.0",
+    "@ffmpeg/core-st": "0.11.1",
     "@ffmpeg/ffmpeg": "^0.11.6",
     "react": "19.3.1",
     "react-dom": "19.3.1"
   },
   "description": "Record your own Suno songs from a browser tab, remove steady background noise, and export a clean WAV for Audio Lab.",
   "devDependencies": {
+    "@ffmpeg/core": "0.11.0",
     "@types/node": "^24.19.2",
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",

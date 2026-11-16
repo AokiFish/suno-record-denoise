@@ -1,6 +1,6 @@
 # PROGRESS — suno-record-denoise 脚手架
 
-日期：2026-11-16。状态：**v2 完成，本地验收全过（`npm run check` 退出 0）；未推 GitHub、未动 Cloudflare（任务禁做，留父代理安排）。**
+日期：2026-11-16。状态：**v3 完成，本地验收全过（`npm run check` 退出 0，28/28 测试）；未推 GitHub、未动 Cloudflare（任务禁做，留父代理安排）。**
 
 本地目录 `~/workspace/suno-record-denoise/`。远端空库 `AokiFish/suno-record-denoise` 已由 Luca 建好（MEMORY 记：初始提交 `ff5a6a6d` 可读），本子任务未推任何文件。
 
@@ -182,3 +182,82 @@ noisereduce（`/tmp/noisereduce-src`，HEAD `51c85343`，已核对 `noisereduce.
 - 无外部字体 @import；首屏不全加载（见 §8）。✓
 - 旧“手机浏览器不支持”误报文案未出现；三态文案为可用/被拦/不支持。✓
 - iframe 里被拦的录制逻辑没有原样搬过来冒充修好——`capture.ts` 的 `detectCaptureState` 在 iframe 内无接口时判 `blocked`，按钮禁用 + 如实说明。✓
+
+## v3 修复（2026-11-16，Luca 真机报 bug 后）
+
+**正名**：v2 节里两处说法作废，以本节为准——① “core 0.11.0 是单线程版”（它是多线程版）；② “`public/ffmpeg/` 由 `@ffmpeg/core` 包自动生成”（v3 起由 `@ffmpeg/core-st` 生成）。其余 v2 实测数（CLI 线、采样/LR4/`bn` 否决、nf 标定差）不受影响。
+
+### 两个根因 + 证据
+
+**根因 1——引擎（v2 用错 core）**：v2 用的 `@ffmpeg/core@0.11.0` 是多线程版，不是单线程版。证据：它的 JS 里 `SharedArrayBuffer` 出现 4 次，core-st 是 0 次；core-st 的 JS 里 `_main` 3 处、`_proxy_main` 0 处（多线程版反之）。SharedArrayBuffer 只在 COOP/COEP 跨域隔离下才存在，Cloudflare Pages 默认不发这两个头，无隔离的页面里根本没有这个对象。Luca 2026-11-16 14:49 真机亲眼看到原文：`SharedArrayBuffer is not defined`，降噪恒失败。Node 自带 SharedArrayBuffer，所以 v2 的全部 Node 测试都过了、真机才炸——v2 的漏验，本节的 SAB 测试就是补这个漏验。
+
+**根因 2——播放门（Workbench）**：`src/components/Workbench.tsx` 的 `startBoth()` 在 `origBufRef.current` 与 `procBufRef.current` 有一个不存在时就直接 return；`procBufRef` 只在降噪成功后才有；引擎一失败 → `processed` 恒为 null → `startBoth` 直接返回 → 原声也播不了。v1 的手写 DSP 是同步的、总能成功，所以这个门一直潜伏着；v2 引擎一失败就变成永久性的。`src/components/Library.tsx` 不许动（无证据表明它坏了），未动。
+
+### 改动
+
+**引擎换官方单线程版 `@ffmpeg/core-st@0.11.1`**（`package.json` dependencies，钉死 0.11.1，不许用 `^` 浮动；`@ffmpeg/core@0.11.0` 只留 devDependencies，供 SAB 回归测试当反例，永不打包进应用）：
+- `scripts/fetch-ffmpeg-core.mjs` 改成从 `@ffmpeg/core-st/dist` 拷：`ffmpeg-core.js` 86,313 B、`ffmpeg-core.wasm` 24,383,038 B、`ffmpeg-core.worker.js` 0 B（占位文件，单线程版不起 pthread worker；但浏览器 loader 会按 corePath 同名推导它的路径，缺一不可）。三文件与包内文件 sha256 逐字节相同。已实测：`rm -rf public/ffmpeg && npm install --legacy-peer-deps` 后三文件自动再生、`npm run build` 后 `dist/ffmpeg/` 齐全。
+- `mainName: 'main'`：core-st 只导出 `_main`，不导出多线程版的 `_proxy_main`；不传会报 `Cannot call unknown function proxy_main`（已实测，见下“探针”）。
+- **单次运行 + 跑完丢弃实例**：core-st 实例 main 返回后 Emscripten runtime 退出，同一实例第二次 run 报 `Program terminated with exit(0)`。`processWithFfmpeg` 每次跑完即在 finally 里丢弃实例（`ffmpegInstance = null; loadPromise = null`），下次调用重新加载（文件已缓存，只重建实例）。工作台 400 ms 防抖重算就靠这个。
+
+**播放与降噪解耦（`src/components/Workbench.tsx` + 新增 `src/audio/playback.ts`）**：
+- `startBoth` 不许再因为缺一边就整体 return——有哪边播哪边；请求的一侧不存在时退到另一侧，两侧都不存在才返回。
+- `togglePlay` 默认走原声（v2 是默认走降噪后）；`switchSide('proc')` 在 processed 为 null 时直接返回，不许杀掉正在播的原声；已在播放时只调已存在的增益节点。
+- 降噪后按钮在 processed 为 null 时 `disabled` + `title` 说明；引擎失败时下方有看得见的红字状态（原声仍可正常播放），加载中/未就绪时有 muted 提示。两边都有时同响度 A/B 行为不变。400 ms 防抖自动重算与引擎失败如实报错保留。
+- `playableSides(hasProcessed)` 纯函数（`src/audio/playback.ts`）：原声永远可播，降噪后只有 processed 存在时可播；工作台与测试共用同一条规则。
+
+### 验收（v3，逐条证据）
+
+- `npm run check` 退出 0：`tsc --noEmit` 0 错误；vitest **28/28 通过**（`tests/dsp.test.ts` 18、真歌 CLI 5、真歌 wasm 2、SAB 1、播放门 2）；`vite build` 退出 0（63 模块，`✓ built in 2.18s`；新 chunk：`index-BRgKEyjr.js` 239.27 kB、`Workbench-A83ehxh3.js` 35.30 kB）。
+- SAB 删除测试（`tests/sab.test.ts`，1/1 通过）：Node 里 `globalThis.SharedArrayBuffer = undefined` 后，旧 MT core `loadFfmpeg('@ffmpeg/core')` 加载失败（只断言失败，不对报错文案做断言——Node 里的文案是 `Right-hand side of 'instanceof' is not an object`，与浏览器里的 `SharedArrayBuffer is not defined` 不同，根因同一）；core-st 加载成功，并在真歌 fixture 上跑通出货链，指标与下表 0.50 行逐值相同（用时 1.3 秒）。
+- core-st 真歌指标表（默认强度 0.5，出货链 `highpass=f=90,afftdn=nr=12:nf=-30`）：与 v2 的 MT core 数**逐值相同**（`tests/out/real-song-wasm-metrics.json` 已重写，engine 字段为 `ffmpeg.wasm 0.11.6 + @ffmpeg/core-st 0.11.1`；输出采样数 1,850,809，与 v2 相同，尾部短 1391 采样不变）。
+
+| 验收项 | 标准 | CLI ffmpeg 8.1（交叉对照，未变） | core-st 0.11.1（出货核心） |
+| --- | --- | --- | --- |
+| brilliance 5–10k 降 | ≥ 6 dB | **−11.27 dB** ✓ | **−7.15 dB** ✓ |
+| air 10–20k 降 | ≥ 6 dB | **−11.91 dB** ✓ | **−11.11 dB** ✓ |
+| 低频段 20–250 Hz 变化 | < 1 dB | **−0.68 dB** ✓ | **−0.56 dB** ✓ |
+| 中频段 500–2000 Hz 变化 | < 1 dB | **−0.09 dB** ✓ | **−0.01 dB** ✓ |
+| 新增削波 | 0 | 0 → 0 ✓ | 0 → 0 ✓ |
+| 静音段 | < −50 dBFS | −120.00 dBFS ✓ | −69.97 dBFS ✓ |
+| 噪声底 / SNR 变化 | — | −36.76 → −39.76 / +2.81 | −37.18 → −39.78 / +2.47 |
+
+- 强度映射表四锚点在 core-st 上重测（临时测试 `tests/ladder-st.tmp.test.ts`，跑完已删；nr/nf 锚点不变）：
+
+| 强度 | nr / nf | brilliance（core-st） | air（core-st） | 低频（core-st） | 中频（core-st） |
+| --- | --- | --- | --- | --- | --- |
+| 0.25 | 6 / −30 | −4.58 dB | −5.85 dB | −0.56 dB | −0.01 dB |
+| 0.50（默认） | 12 / −30 | −7.15 dB | −11.11 dB | −0.56 dB | −0.01 dB |
+| 0.75 | 20 / −30 | −8.60 dB | −15.59 dB | −0.56 dB | −0.01 dB |
+| 1.00 | 30 / −30 | −9.20 dB | −17.52 dB | −0.56 dB | −0.01 dB |
+
+与 v2 在 MT core 上的梯子数逐值相差 ≤0.03 dB（舍入级），映射表不变，不重标。
+- 连续跑两次测试（`tests/real-song-wasm.test.ts` 新增，1/1 通过）：同一 `processWithFfmpeg` 接口连续跑两次都成功（第二次自动重载实例），两次输出均为 42,978 采样。
+- 播放门测试（`tests/playback.test.ts`，2/2 通过）：`playableSides(false)` → `{ orig: true, proc: false }`；`playableSides(true)` → `{ orig: true, proc: true }`。
+- README / PROJECT-SPEC.md / PROGRESS.md 三份文档已更新（本节 + README“引擎选型 v3”+ PROJECT-SPEC §4/§7/§8）；v2 的“core 0.11.0 单线程”错误说法在 README、PROJECT-SPEC、引擎注释、fetch 脚本四处已纠正。
+
+### 探针记录（单次运行问题是怎么查到的）
+
+梯子临时测试第一次跑时只出了 0.25 行就失败：`ExitStatus: Program terminated with exit(0)`。两个探针（临时测试 `tests/probe-rerun.tmp.test.ts`，跑完已删）：
+- 探针 A（全局 `Module.noExitRuntime = true`，同一实例跑两次）：第 1 次输出 42,978 采样，第 2 次照样 `Program terminated with exit(0)`——全局设置救不了，工厂不采纳。
+- 探针 B（全新实例重载再跑）：第 1 个实例跑完 42,978 采样，第 2 个全新实例加载后跑出 42,978 采样——重载可跑。
+- 另：`@ffmpeg/ffmpeg@0.11.6` 的 `createFFmpeg` 调 `createFFmpegCore` 时只传 `mainScriptUrlOrBlob` / `print` / `printErr` / `locateFile` 四个字段（已读源码），不透传 `noExitRuntime`——所以只能用“跑完丢弃实例”这一招。结论已写进 `src/audio/ffmpegEngine.ts` 的 `loadFfmpeg` 注释与本节。
+
+### 否掉的方案
+
+- **多线程 core + Pages `_headers` 发 COOP/COEP**：能行（Pages 支持 `_headers`），但 COEP 会要求所有子资源带 CORP，牵连面大；core-st 同数零配置，更简单。不用。
+- **0.12.x**：任务钉死 0.11 线，无收益。不升。
+- **全局 `Module.noExitRuntime`**：探针 A 实测无效。不用。
+- **绕过 `@ffmpeg/ffmpeg` 直接调 core 工厂**：改动大（load/run/FS/进度都要重写），没必要——重载实例已够用。不用。
+- **悄悄切回旧手写引擎**：已删，永不回来。不用。
+
+### 已知限制（v3 新增）
+
+- 单线程 core 跑在调用线程上：长歌降噪期间主线程会被占住，进度条可能跳变而非平滑推进；跑完即恢复。已写入 README 已知限制。
+- 每次降噪都会重新加载引擎实例（core-st 单次运行所致）；文件已缓存，只重建实例，42 秒歌单次约 1–4 秒。
+
+### 未验项（v3，sandbox-only，留给 Luca 真机）
+
+1. **真浏览器里的 core-st 加载与降噪**：只在 Node 里跑过（fetch shim + `@ffmpeg/core-st` 直引）；浏览器里 `public/ffmpeg/` 的 core-st 加载、工作台懒加载、进度条、连续重算均未验（沙盒无浏览器）。须 Luca 在部署后的顶层页实测——重点是：打开工作台不再报 SharedArrayBuffer、拖强度滑块重算不报错。
+2. **真机播放**：原声可播、降噪后可用、A/B 切换不杀声，均未验。须 Luca 真机实测。
+3. v2 未验项 1、3、4 未变（真机录制、四格式真实上传解码、控制台零错误、移动端 settle、IndexedDB 真实读写）。

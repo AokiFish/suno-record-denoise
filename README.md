@@ -7,7 +7,7 @@
 ## 做法（诚实说明）
 
 - **录制**：顶层页面用 `getDisplayMedia` 抓标签页音频（Chrome / Edge 桌面版），或麦克风录音，或上传已下载的音频文件。音频只在你的浏览器里处理，不上传到任何服务器。录制用 192 kbps（`audioBitsPerSecond: 192000`）；录制时 Suno 标签页与本站标签页都要保持在前台，切后台会被 Chrome 节流、录音断点。
-- **降噪**：FFmpeg `afftdn`（ffmpeg.wasm 单线程版，见下“引擎选型”）+ 90 Hz 高通 + 静音门（默认关）。不是 AI 模型、不做人声分离、不修削波，只压稳态杂音。
+- **降噪**：FFmpeg `afftdn`（ffmpeg.wasm 官方单线程版 `@ffmpeg/core-st@0.11.1`，见下“引擎选型”）+ 90 Hz 高通 + 静音门（默认关）。不是 AI 模型、不做人声分离、不修削波，只压稳态杂音。原声永远可播——降噪引擎失败时降噪后不可用，但原声照常播（v3 修的真机 bug）。
 - **对照**：原声 / 降噪后同响度 A/B，切换时播放位置不变。
 - **导出**：浏览器内编码 16-bit PCM WAV（44.1 kHz），附 `denoise-report.json`（指标 + 警告）。
 
@@ -27,9 +27,13 @@
 - **被容器拦截**——页面跑在 iframe 里、容器没给 `display-capture` 权限，浏览器根本不暴露标签页捕获接口。换浏览器也没用，只有脱离 iframe（独立部署本站）才能录。这是 Muse 空间版做不到、所以才有这个独立项目的原因。
 - **浏览器不支持**——Firefox / Safari 不带标签页音频，移动浏览器不支持标签页捕获。请用桌面 Chrome / Edge。
 
-## 引擎选型（v2，2026-11-16）
+## 引擎选型（v3，2026-11-16）
 
-v1 的手写教科书谱减法已被删除（Luca 实测批评：降噪效果一般、且未照任何顶级实现移植）。v2 引擎 = **FFmpeg `afftdn`**（`libavfilter/af_afftdn.c`，2018 年加入 FFmpeg 的 FFT 降噪滤镜），经 ffmpeg.wasm 单线程版（`@ffmpeg/ffmpeg@0.11.6` + `@ffmpeg/core@0.11.0`，钉死不升 0.12.x）在浏览器里跑；单线程 core 不用 SharedArrayBuffer / COOP / COEP，纯静态托管就能跑，Cloudflare Pages 不用改任何配置。滤镜串：`highpass=f=90,afftdn=nr=X:nf=Y`，强度滑块映射到 `nr`/`nf`（默认 50% → `nr=12:nf=-30`；完整映射表与实测数见 `PROGRESS.md`）。
+v1 的手写教科书谱减法已被删除（Luca 实测批评：降噪效果一般、且未照任何顶级实现移植）。引擎 = **FFmpeg `afftdn`**（`libavfilter/af_afftdn.c`，2018 年加入 FFmpeg 的 FFT 降噪滤镜），经 ffmpeg.wasm 官方单线程版（`@ffmpeg/ffmpeg@0.11.6` + `@ffmpeg/core-st@0.11.1`，钉死不升 0.12.x）在浏览器里跑；单线程 core 不用 SharedArrayBuffer / COOP / COEP，纯静态托管就能跑，Cloudflare Pages 不用改任何配置。滤镜串：`highpass=f=90,afftdn=nr=X:nf=Y`，强度滑块映射到 `nr`/`nf`（默认 50% → `nr=12:nf=-30`；完整映射表与实测数见 `PROGRESS.md`）。
+
+**正名（v3）**：v2 用的 `@ffmpeg/core@0.11.0` 是多线程版，不是单线程版——它的 JS 里有 4 处 SharedArrayBuffer 引用，core-st 是 0 处。v2 简报里“core 0.11.0 是单线程版”的说法是错的；Node 自带 SharedArrayBuffer，所以 v2 的全部 Node 测试都过了，真机（无 COOP/COEP 隔离的页面）一加载就报 `SharedArrayBuffer is not defined`，降噪恒失败。v3 起出货核心是官方单线程版 `@ffmpeg/core-st@0.11.1`，并有专门的回归测试（`tests/sab.test.ts`：删掉 SharedArrayBuffer 后旧 core 加载失败、core-st 加载成功并跑通真歌链）。
+
+两处 core-st 的工程细节（都实测过）：① 它只导出 `_main` 不导出多线程版的 `_proxy_main`，所以加载时必须传 `mainName: 'main'`，否则报 `Cannot call unknown function proxy_main`；② 它的实例是单次运行的——main 返回后 Emscripten runtime 退出，同一实例第二次 run 会报 `Program terminated with exit(0)`，所以每次跑完即丢弃实例、下次调用重新加载（工作台 400 ms 防抖重算就靠这个，`tests/real-song-wasm.test.ts` 里有连续跑两次的回归测试）。
 
 参照来源（都读过源码原文，不是凭印象）：
 
@@ -80,7 +84,8 @@ npm run check      # tsc --noEmit && npm test && npm run build
 | Vite | 7.3.8 |
 | TypeScript | 5.9.3 |
 | @vitejs/plugin-react | 4.7.0 |
-| @ffmpeg/ffmpeg / @ffmpeg/core | 0.11.6 / 0.11.0（单线程 wasm，钉死） |
+| @ffmpeg/ffmpeg / @ffmpeg/core-st | 0.11.6 / 0.11.1（官方单线程 wasm，钉死） |
+| @ffmpeg/core（仅 dev，供 SAB 回归测试当反例） | 0.11.0（多线程版，永不打包进应用） |
 | vitest | 4.1.12 |
 
 纯 CSS（CSS 变量），无 UI 组件库；录音库用 IndexedDB（库名 `suno-record-denoise`，`recordings` 存元数据、`audio` 存音频 Blob）。
@@ -99,6 +104,7 @@ src/
     capture.ts            # getDisplayMedia / MediaRecorder（192 kbps）/ 三态检测
     dsp.ts                # 测量（频段/噪声底/削波/静音）、静音门、指标；不再含引擎
     ffmpegEngine.ts       # FFmpeg afftdn 引擎：wasm 懒加载、强度→nr/nf 映射
+    playback.ts           # 哪几侧可播（纯函数，供工作台与测试共用）
     fft.ts                # 基 2 迭代 FFT/IFFT
     loudness.ts           # 简化 BS.1770 + A/B 同响度增益
     wav.ts                # 16-bit PCM WAV 编解码
@@ -117,5 +123,6 @@ tests/
 - 降噪强度拉满会在安静段落留下轻微“水声”（音乐噪声），属谱门固有 artifact；默认 50% 是折中。
 - 静音门默认关；打开后连续 ≥200 ms 的数字静音（RMS < −60 dBFS）在段首留 100 ms 后压到 0，淡入淡出各 50 ms，有声段完全不动。
 - wasm 输出尾部比输入短 1391 采样（31.5 ms），只在尾部；头部与中部逐采样对齐，A/B 切换不受影响。
+- 单线程 core 跑在调用线程上：长歌降噪期间主线程会被占住，进度条可能跳变而非平滑推进；跑完即恢复。每次降噪都会重新加载引擎实例（core-st 单次运行所致，见“引擎选型”）。
 - 响度用的是简化 BS.1770（K 计权 + 门控），绝对 LUFS 与专业表可能差零点几 LU；A/B 只依赖两段的相对差，够用。
 - 录音存在浏览器 IndexedDB 里：清浏览器数据会丢；换设备、换浏览器看不到。
