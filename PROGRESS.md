@@ -75,6 +75,8 @@ vitest `上传校验` 组 7/7 通过：wav / mp3 / flac / m4a 通过；`notes.tx
 
 ## v2 引擎重做（2026-11-16，Luca 实测批评后）
 
+- 2026-11-16 14:35 触发提交：验证 Cloudflare 重连 GitHub 后 push 是否自动部署（3fc2cc54 推时连接已断，未触发构建）。
+
 ### 验收（v2，逐条证据）
 
 - `npm run check` 退出 0（`tsc --noEmit && npm test && npm run build`）：tsc 0 错误；vitest **24/24 通过**（`tests/dsp.test.ts` 18、真歌 CLI 5、真歌 wasm 1）；`vite build` 退出 0，`✓ built in 2.35s`。注：中途一次全量跑曾有 1 个门测试失败（单跑通过；失败位置在 `it` 行、无断言错误，疑似并行跑时超 5 s 默认超时——该测试曾逐采样做 26 万次 `expect`）——已改成先算最大差、一次断言，重跑全绿。
