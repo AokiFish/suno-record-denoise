@@ -32,6 +32,7 @@ export const copy = {
       '录制时 Suno 标签页与本站标签页都要保持在前台：切到后台会被 Chrome 节流，录音会出现断点。',
     foregroundWarnMic:
       '录制时本站标签页要保持在前台：切到后台会被 Chrome 节流，录音会出现断点。',
+    dropoutLive: '刚才断了一下',
   },
   workbench: {
     noRecording: '先去“录制”录一首歌，或从录音库打开一首。',
@@ -47,6 +48,20 @@ export const copy = {
     gateLabel: '静音门',
     gateHint:
       '默认关。打开后只压全频段 RMS < −60 dBFS 的静音段，淡入淡出 50 ms；有声段完全不动。',
+    dropoutTitle: '断点',
+    dropoutNone: '没检出断点。',
+    dropoutDetected: '检出',
+    dropoutUnit: '个断点',
+    dropoutRepaired: '修了',
+    dropoutShort: '个（≤50 ms）',
+    dropoutLong: '个长缺口未修（只淡化了边缘）',
+    dropoutFixed: '已修复',
+    dropoutLongLabel: '长缺口未修',
+    dropoutNote:
+      '短断点用前后音频交叉淡化填满；长缺口（>50 ms）缺失的音乐找不回来，只淡化了边缘，听着不断就行、内容补不回来。',
+    repairLabel: '自动修复短断点（≤50 ms）',
+    repairHint: '默认开。关掉后听到的是录制原样（含断点）。',
+    recordingDropouts: '本次录制中断',
     engineLoading: '正在加载降噪引擎 FFmpeg afftdn（首次约 25 MB，之后缓存）…',
     engineReady: '引擎：FFmpeg afftdn（已加载）',
     engineError: '降噪引擎加载失败：',

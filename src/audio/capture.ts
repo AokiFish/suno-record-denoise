@@ -9,6 +9,7 @@
  *   勾上才有声音；不勾会录成静音，本应用检测到无音频轨时如实提示。
  */
 import type { RecordingSource } from './types';
+import { analyzeChunkTimestamps, type ChunkDropoutStats } from './dropouts';
 
 export type CaptureState = 'available' | 'blocked' | 'unsupported';
 
@@ -54,8 +55,12 @@ export interface ActiveRecording {
   stop: () => Promise<Blob>;
   cancel: () => void;
   stream: MediaStream;
-  /** 录制 chunk 统计（断点定位用）：MediaRecorder 每 250 ms 吐一个 chunk。 */
-  stats: () => { chunkCount: number; totalBytes: number };
+  /**
+   * 录制 chunk 统计（断点定位用）：MediaRecorder 每 250 ms 吐一个 chunk。
+   * dropouts：相邻 chunk 到达间隔 > 500 ms 的次数与时刻（相对录制开始），
+   * 录制中卡顿的实时证据——断点在时间轴上，降噪修不了它。
+   */
+  stats: () => { chunkCount: number; totalBytes: number; dropouts: ChunkDropoutStats };
 }
 
 function recordStream(stream: MediaStream, mimeType: string | undefined): ActiveRecording {
@@ -68,7 +73,12 @@ function recordStream(stream: MediaStream, mimeType: string | undefined): Active
   );
   const chunks: Blob[] = [];
   let totalBytes = 0;
+  // 每次 ondataavailable 的到达时间戳（相对录制开始，ms）：250 ms 节拍，
+  // 间隔 > 500 ms 即一次断点。空 chunk 也记时间（节拍本身即证据）。
+  const startMs = performance.now();
+  const arrivalMs: number[] = [];
   recorder.ondataavailable = (e: BlobEvent) => {
+    arrivalMs.push(performance.now() - startMs);
     if (e.data.size > 0) {
       chunks.push(e.data);
       totalBytes += e.data.size;
@@ -84,7 +94,11 @@ function recordStream(stream: MediaStream, mimeType: string | undefined): Active
   recorder.start(250);
   return {
     stream,
-    stats: () => ({ chunkCount: chunks.length, totalBytes }),
+    stats: () => ({
+      chunkCount: chunks.length,
+      totalBytes,
+      dropouts: analyzeChunkTimestamps(arrivalMs),
+    }),
     stop: () => {
       return new Promise<Blob>((resolve) => {
         if (recorder.state === 'inactive') {

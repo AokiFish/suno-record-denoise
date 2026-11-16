@@ -27,6 +27,7 @@ export default function RecordView(props: {
   const [captureState] = useState<CaptureState>(() => detectCaptureState());
   const [active, setActive] = useState<{ kind: RecordingSource; rec: ActiveRecording } | null>(null);
   const [elapsed, setElapsed] = useState(0);
+  const [dropoutCount, setDropoutCount] = useState(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [ns, setNs] = useState(true);
@@ -42,6 +43,8 @@ export default function RecordView(props: {
     const started = Date.now();
     const timer = window.setInterval(() => {
       setElapsed(Math.floor((Date.now() - started) / 1000));
+      // 录制中断点提示：约每 500 ms 读一次 chunk 到达统计。
+      setDropoutCount(active.rec.stats().dropouts.count);
     }, 500);
     return () => window.clearInterval(timer);
   }, [active]);
@@ -58,7 +61,7 @@ export default function RecordView(props: {
   async function saveBlob(
     blob: Blob,
     source: RecordingSource,
-    stats?: { chunkCount: number; totalBytes: number },
+    stats?: { chunkCount: number; totalBytes: number; dropouts: { count: number; timesSec: number[] } },
   ): Promise<void> {
     setBusy(true);
     setError('');
@@ -83,6 +86,8 @@ export default function RecordView(props: {
         // 数量明显偏少或总字节与时长对不上，说明录制中被节流丢过数据。
         chunkCount: stats?.chunkCount,
         totalBytes: stats?.totalBytes,
+        // 录制时 chunk 到达间隔 > 500 ms 的次数（v4；上传文件没有）。
+        dropoutCount: stats?.dropouts.count,
         settings: null,
         metrics: null,
       };
@@ -101,6 +106,7 @@ export default function RecordView(props: {
     try {
       const rec = await startTabCapture();
       setElapsed(0);
+      setDropoutCount(0);
       setActive({ kind: 'tab', rec });
     } catch (e) {
       if (e instanceof Error && e.message === 'NO_AUDIO_TRACK') {
@@ -140,6 +146,7 @@ export default function RecordView(props: {
       };
       tick();
       setElapsed(0);
+      setDropoutCount(0);
       setActive({ kind: 'mic', rec });
     } catch (e) {
       if (e instanceof DOMException && e.name === 'NotAllowedError') {
@@ -195,6 +202,11 @@ export default function RecordView(props: {
         {recording && active.kind === 'tab' && (
           <p aria-live="polite">
             {copy.record.tabRecording} {formatElapsed(elapsed)}
+          </p>
+        )}
+        {recording && dropoutCount > 0 && (
+          <p className="error" role="status" aria-live="polite">
+            {copy.record.dropoutLive} ×{dropoutCount}
           </p>
         )}
         {!recording && (

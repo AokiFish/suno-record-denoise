@@ -11,6 +11,8 @@ interface WaveformProps {
   noiseStartSec?: number;
   noiseEndSec?: number;
   onSelect?: (startSec: number, endSec: number) => void;
+  /** v4 断点标记：红底标出检出的断点位置（只显示）。 */
+  gaps?: Array<{ startSec: number; endSec: number }>;
 }
 
 /** 波形画布：v2 只作显示。 */
@@ -42,6 +44,15 @@ export default function Waveform(props: WaveformProps): ReactNode {
       ctx.fillStyle = 'rgba(10, 122, 255, 0.15)';
       ctx.fillRect(x0, 0, Math.max(2, x1 - x0), height);
     }
+    // 断点标记（v4）：红底，位置按起止时间换算
+    if (props.gaps) {
+      ctx.fillStyle = 'rgba(255, 59, 48, 0.35)';
+      for (const g of props.gaps) {
+        const x0 = (g.startSec / props.durationSec) * width;
+        const x1 = (g.endSec / props.durationSec) * width;
+        ctx.fillRect(x0, 0, Math.max(2, x1 - x0), height);
+      }
+    }
     // 波形
     ctx.fillStyle = accent;
     const peaks = props.peaks;
@@ -51,7 +62,7 @@ export default function Waveform(props: WaveformProps): ReactNode {
       const x = i * colW;
       ctx.fillRect(x, (height - h) / 2, Math.max(1, colW - 0.5), h);
     }
-  }, [props.peaks, props.noiseStartSec, props.noiseEndSec, props.durationSec]);
+  }, [props.peaks, props.noiseStartSec, props.noiseEndSec, props.gaps, props.durationSec]);
 
   const secFromEvent = (e: React.PointerEvent<HTMLCanvasElement>): number => {
     const rect = e.currentTarget.getBoundingClientRect();

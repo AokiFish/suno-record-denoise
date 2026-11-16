@@ -1,3 +1,5 @@
+import type { Dropout } from './dropouts';
+
 export interface DenoiseSettings {
   /** 0..1，0.5 为默认。0 = 只做高通，不进 afftdn。 */
   strength: number;
@@ -25,6 +27,23 @@ export interface DenoiseMetrics {
 
 export type RecordingSource = 'tab' | 'mic' | 'upload';
 
+export interface DropoutRepairSummary {
+  detected: number;
+  repaired: number;
+  unrepaired: number;
+  gaps: Array<Dropout & { repaired: boolean }>;
+}
+
+export interface DropoutReport {
+  /** 检出断点数 / 修了几个短缺口 / 几个长缺口未修。 */
+  detected: number;
+  repaired: number;
+  unrepaired: number;
+  /** 录制时 chunk 到达间隔 > 500 ms 的次数（上传文件没有）。 */
+  recordingDropouts?: number;
+  gaps: Array<Dropout & { repaired: boolean }>;
+}
+
 export interface RecordingMeta {
   id: string;
   title: string;
@@ -38,6 +57,10 @@ export interface RecordingMeta {
   /** 录制 chunk 统计（断点定位用；上传文件没有）。 */
   chunkCount?: number;
   totalBytes?: number;
+  /** 录制时 chunk 到达间隔 > 500 ms 的次数（v4；上传文件没有）。 */
+  dropoutCount?: number;
+  /** 断点检出/修复统计（v4；打开工作台检出后写入）。 */
+  dropoutRepair?: DropoutRepairSummary;
   settings: DenoiseSettings | null;
   metrics: DenoiseMetrics | null;
 }
@@ -58,6 +81,8 @@ export interface DenoiseReport {
   };
   metrics: DenoiseMetrics;
   ab: { gainOriginalDb: number; gainProcessedDb: number; loudnessDiffLu: number };
+  /** 断点检出/修复统计（v4，可选：老报告没有）。 */
+  dropouts?: DropoutReport;
   warnings: string[];
   export: { format: 'wav'; sampleRate: number; bits: number };
   nextStep: string;

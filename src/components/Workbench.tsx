@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { applySilenceGate, computeMetrics } from '../audio/dsp';
+import { detectDropouts, repairShortGaps, type Dropout } from '../audio/dropouts';
 import { HIGHPASS_HZ, isFfmpegLoaded, processWithFfmpeg } from '../audio/ffmpegEngine';
 import { playableSides } from '../audio/playback';
 import { abGains, integratedLoudness } from '../audio/loudness';
@@ -42,7 +43,11 @@ export default function Workbench(props: {
   const [meta, setMeta] = useState<RecordingMeta | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
-  const [channels, setChannels] = useState<Float32Array[] | null>(null);
+  // 原声声道：rawChannels 是解码原样；channels 是修过断点的版本（开关控制）。
+  // 断点在录音里，不在降噪后，所以修复发生在解码后、降噪前。
+  const [rawChannels, setRawChannels] = useState<Float32Array[] | null>(null);
+  const [gaps, setGaps] = useState<Dropout[]>([]);
+  const [repairEnabled, setRepairEnabled] = useState(true);
   const [sampleRate, setSampleRate] = useState(44100);
   const [title, setTitle] = useState('');
   const [strength, setStrength] = useState(0.5);
@@ -69,6 +74,31 @@ export default function Workbench(props: {
   const playingRef = useRef<PlayingSide>(null);
   const durationSec = meta?.durationSec ?? 0;
 
+  // 断点修复（v4）：对解码原声修一次；无断点时直接返回原声，不复制。
+  const repairResult = useMemo(
+    () => (rawChannels && gaps.length > 0 ? repairShortGaps(rawChannels, sampleRate, gaps) : null),
+    [rawChannels, gaps, sampleRate],
+  );
+  const channels = repairEnabled ? (repairResult?.channels ?? rawChannels) : rawChannels;
+
+  // 检出/修复统计（展示、报告、meta 共用同一份数）。
+  const dropoutSummary = useMemo(() => {
+    if (!repairEnabled || !repairResult) {
+      return {
+        detected: gaps.length,
+        repaired: 0,
+        unrepaired: gaps.length,
+        gaps: gaps.map((g) => ({ ...g, repaired: false })),
+      };
+    }
+    return {
+      detected: gaps.length,
+      repaired: repairResult.repaired,
+      unrepaired: repairResult.unrepaired,
+      gaps: repairResult.results.map((r) => ({ ...r.gap, repaired: r.repaired })),
+    };
+  }, [gaps, repairEnabled, repairResult]);
+
   const peaks = useMemo(
     () => (channels ? computePeaks(channels) : []),
     [channels],
@@ -91,7 +121,10 @@ export default function Workbench(props: {
       const decoded = await decodeBlob(blob, new OfflineAudioContext(2, 1, 44100));
       setMeta(m);
       setTitle(m.title);
-      setChannels(decoded.channels);
+      // 断点检测（v4）：解码后立即检一次；修复由下面的 useMemo 做。
+      setRawChannels(decoded.channels);
+      setGaps(detectDropouts(decoded.channels, decoded.sampleRate));
+      setRepairEnabled(true);
       setSampleRate(decoded.sampleRate);
       const s = m.settings;
       if (s) {
@@ -110,6 +143,19 @@ export default function Workbench(props: {
     if (props.recordingId) void load(props.recordingId);
     else setLoading(false);
   }, [props.recordingId, load]);
+
+  // 检出/修复统计写进录音 meta（v4，可选字段，老库无此字段也兼容）。
+  useEffect(() => {
+    if (!meta) return;
+    void updateRecordingMeta(meta.id, {
+      dropoutRepair: {
+        detected: dropoutSummary.detected,
+        repaired: dropoutSummary.repaired,
+        unrepaired: dropoutSummary.unrepaired,
+        gaps: dropoutSummary.gaps,
+      },
+    }).catch(() => undefined);
+  }, [meta, dropoutSummary]);
 
   const runProcess = useCallback(
     async (ch: Float32Array[], sr: number, str: number, gate: boolean) => {
@@ -385,11 +431,23 @@ export default function Workbench(props: {
       silenceGate: gateEnabled,
     };
     downloadJson(
-      buildReport(meta, settings, metrics, {
-        gainOriginalDb: ab.gainOriginalDb,
-        gainProcessedDb: ab.gainProcessedDb,
-        loudnessDiffLu: ab.diffLu,
-      }),
+      buildReport(
+        meta,
+        settings,
+        metrics,
+        {
+          gainOriginalDb: ab.gainOriginalDb,
+          gainProcessedDb: ab.gainProcessedDb,
+          loudnessDiffLu: ab.diffLu,
+        },
+        {
+          detected: dropoutSummary.detected,
+          repaired: dropoutSummary.repaired,
+          unrepaired: dropoutSummary.unrepaired,
+          recordingDropouts: meta.dropoutCount,
+          gaps: dropoutSummary.gaps,
+        },
+      ),
       `${meta.id}-denoise-report.json`,
     );
   }
@@ -432,7 +490,46 @@ export default function Workbench(props: {
       <section className="card" aria-label="波形">
         <h2>{copy.workbench.noiseLabel}</h2>
         <p>{copy.workbench.noiseHint}</p>
-        <Waveform peaks={peaks} durationSec={durationSec} />
+        <Waveform peaks={peaks} durationSec={durationSec} gaps={gaps} />
+      </section>
+
+      <section className="card" aria-label="断点">
+        <h2>{copy.workbench.dropoutTitle}</h2>
+        {meta.dropoutCount !== undefined && (
+          <p className="muted">
+            {copy.workbench.recordingDropouts} {meta.dropoutCount} 次
+          </p>
+        )}
+        {gaps.length === 0 ? (
+          <p className="muted">{copy.workbench.dropoutNone}</p>
+        ) : (
+          <>
+            <p>
+              {copy.workbench.dropoutDetected} {dropoutSummary.detected}{' '}
+              {copy.workbench.dropoutUnit}，{copy.workbench.dropoutRepaired}{' '}
+              {dropoutSummary.repaired} {copy.workbench.dropoutShort}，
+              {dropoutSummary.unrepaired} {copy.workbench.dropoutLong}
+            </p>
+            <p className="muted">{copy.workbench.dropoutNote}</p>
+            <ul>
+              {dropoutSummary.gaps.map((g, idx) => (
+                <li key={idx}>
+                  {g.startSec.toFixed(2)} s – {g.endSec.toFixed(2)} s · {Math.round(g.durationMs)}{' '}
+                  ms · {g.repaired ? copy.workbench.dropoutFixed : copy.workbench.dropoutLongLabel}
+                </li>
+              ))}
+            </ul>
+          </>
+        )}
+        <label>
+          <input
+            type="checkbox"
+            checked={repairEnabled}
+            onChange={(e) => setRepairEnabled(e.target.checked)}
+          />
+          {copy.workbench.repairLabel}
+        </label>
+        <p className="muted">{copy.workbench.repairHint}</p>
       </section>
 
       <section className="card" aria-label="降噪强度">

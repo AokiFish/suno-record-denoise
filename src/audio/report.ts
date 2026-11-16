@@ -1,10 +1,17 @@
-import type { DenoiseMetrics, DenoiseReport, DenoiseSettings, RecordingMeta } from './types';
+import type {
+  DenoiseMetrics,
+  DenoiseReport,
+  DenoiseSettings,
+  DropoutReport,
+  RecordingMeta,
+} from './types';
 
 export function buildReport(
   meta: RecordingMeta,
   settings: DenoiseSettings,
   metrics: DenoiseMetrics,
   ab: { gainOriginalDb: number; gainProcessedDb: number; loudnessDiffLu: number },
+  dropouts?: DropoutReport,
 ): DenoiseReport {
   const warnings: string[] = [];
   if (metrics.clippedAfter > metrics.clippedBefore) {
@@ -18,6 +25,14 @@ export function buildReport(
   }
   if (metrics.noiseFloorAfterDb > -50) {
     warnings.push('降噪后噪声底仍高于 −50 dBFS，杂音可能未除干净。');
+  }
+  if (dropouts && dropouts.unrepaired > 0) {
+    warnings.push(
+      `有 ${dropouts.unrepaired} 个长断点（>50 ms）未修复，缺失的音乐找不回来，建议重录。`,
+    );
+  }
+  if (dropouts && dropouts.recordingDropouts !== undefined && dropouts.recordingDropouts > 0) {
+    warnings.push(`录制时中断 ${dropouts.recordingDropouts} 次，录音里可能有断点。`);
   }
   return {
     app: 'suno-record-denoise',
@@ -39,6 +54,7 @@ export function buildReport(
     },
     metrics,
     ab,
+    dropouts,
     warnings,
     export: { format: 'wav', sampleRate: 44100, bits: 16 },
     nextStep: '把导出的 WAV 上传到 Audio Lab，选想要的声音做增效。',

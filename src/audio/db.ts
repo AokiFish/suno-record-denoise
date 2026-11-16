@@ -76,7 +76,9 @@ export async function saveRecording(meta: RecordingMeta, blob: Blob): Promise<vo
 
 export async function updateRecordingMeta(
   id: string,
-  patch: Partial<Pick<RecordingMeta, 'title' | 'settings' | 'metrics'>>,
+  patch: Partial<
+    Pick<RecordingMeta, 'title' | 'settings' | 'metrics' | 'dropoutCount' | 'dropoutRepair'>
+  >,
 ): Promise<void> {
   const db = await openDb();
   await new Promise<void>((resolve, reject) => {
