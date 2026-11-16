@@ -54,13 +54,25 @@ export interface ActiveRecording {
   stop: () => Promise<Blob>;
   cancel: () => void;
   stream: MediaStream;
+  /** 录制 chunk 统计（断点定位用）：MediaRecorder 每 250 ms 吐一个 chunk。 */
+  stats: () => { chunkCount: number; totalBytes: number };
 }
 
 function recordStream(stream: MediaStream, mimeType: string | undefined): ActiveRecording {
-  const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+  // 音乐录制：192 kbps，避免默认码率在低声部出现可闻压缩伪影；
+  // v1 没设码率，Chrome 默认 opus 码率偏低，是“录音时低声部已卡顿”
+  // 的嫌疑点之一（另一点是后台标签页节流，见 RecordView 前台警告）。
+  const recorder = new MediaRecorder(
+    stream,
+    mimeType ? { mimeType, audioBitsPerSecond: 192000 } : { audioBitsPerSecond: 192000 },
+  );
   const chunks: Blob[] = [];
+  let totalBytes = 0;
   recorder.ondataavailable = (e: BlobEvent) => {
-    if (e.data.size > 0) chunks.push(e.data);
+    if (e.data.size > 0) {
+      chunks.push(e.data);
+      totalBytes += e.data.size;
+    }
   };
   let resolveStop: (blob: Blob) => void = () => undefined;
   const stopped = new Promise<Blob>((resolve) => {
@@ -72,6 +84,7 @@ function recordStream(stream: MediaStream, mimeType: string | undefined): Active
   recorder.start(250);
   return {
     stream,
+    stats: () => ({ chunkCount: chunks.length, totalBytes }),
     stop: () => {
       return new Promise<Blob>((resolve) => {
         if (recorder.state === 'inactive') {
@@ -115,6 +128,7 @@ export async function startTabCapture(): Promise<ActiveRecording> {
   const originalStop = rec.stop;
   return {
     stream: audioOnly,
+    stats: rec.stats,
     cancel: () => {
       rec.cancel();
       for (const track of stream.getTracks()) track.stop();

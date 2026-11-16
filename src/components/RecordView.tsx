@@ -55,7 +55,11 @@ export default function RecordView(props: {
 
   const decodeCtx = () => new OfflineAudioContext(1, 1, 44100);
 
-  async function saveBlob(blob: Blob, source: RecordingSource): Promise<void> {
+  async function saveBlob(
+    blob: Blob,
+    source: RecordingSource,
+    stats?: { chunkCount: number; totalBytes: number },
+  ): Promise<void> {
     setBusy(true);
     setError('');
     try {
@@ -75,6 +79,10 @@ export default function RecordView(props: {
         channels: decoded.channels.length,
         mimeType: blob.type || 'audio/webm',
         sizeBytes: blob.size,
+        // chunk 统计供断点定位：250 ms 一 chunk，录 60 秒应有约 240 个；
+        // 数量明显偏少或总字节与时长对不上，说明录制中被节流丢过数据。
+        chunkCount: stats?.chunkCount,
+        totalBytes: stats?.totalBytes,
         settings: null,
         metrics: null,
       };
@@ -150,12 +158,13 @@ export default function RecordView(props: {
     setLevel(0);
     void meterCtxRef.current?.close().catch(() => undefined);
     meterCtxRef.current = null;
+    const stats = rec.stats();
     const blob = await rec.stop();
     if (blob.size === 0) {
       setError(copy.record.errGeneric);
       return;
     }
-    await saveBlob(blob, kind);
+    await saveBlob(blob, kind, stats);
   }
 
   async function onUploadFile(file: File): Promise<void> {
@@ -180,6 +189,9 @@ export default function RecordView(props: {
         >
           {CAPTURE_STATE_COPY[captureState]}
         </div>
+        <p className="notice warn" role="status">
+          {copy.record.foregroundWarn}
+        </p>
         {recording && active.kind === 'tab' && (
           <p aria-live="polite">
             {copy.record.tabRecording} {formatElapsed(elapsed)}
@@ -217,6 +229,11 @@ export default function RecordView(props: {
           <input type="checkbox" checked={agc} onChange={(e) => setAgc(e.target.checked)} />
           {copy.record.agcLabel}
         </label>
+        {recording && active.kind === 'mic' && (
+          <p className="notice warn" role="status">
+            {copy.record.foregroundWarnMic}
+          </p>
+        )}
         {recording && active.kind === 'mic' && (
           <div className="progress" aria-label="输入电平">
             <div style={{ width: `${Math.round(level * 100)}%` }} />

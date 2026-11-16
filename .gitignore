@@ -3,3 +3,5 @@ dist/
 tests/out/
 .DS_Store
 *.local
+tests/fixtures/
+public/ffmpeg/

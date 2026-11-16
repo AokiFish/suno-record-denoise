@@ -32,11 +32,10 @@ export function buildReport(
       channels: meta.channels,
     },
     denoise: {
-      method: 'spectral-subtraction + highpass',
+      method: 'FFmpeg afftdn',
       strength: settings.strength,
       highpassHz: settings.highpassHz,
-      noiseSegmentSec: [settings.noiseStartSec, settings.noiseEndSec],
-      autoNoise: settings.autoNoise,
+      silenceGate: settings.silenceGate,
     },
     metrics,
     ab,

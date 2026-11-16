@@ -1,15 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { fftForward, fftInverse } from '../src/audio/fft';
 import {
-  bandLevels,
-  checkSilence,
+  applySilenceGate,
   computeMetrics,
   findQuietestWindow,
-  learnNoiseProfile,
-  processAudio,
-  HIGHPASS_HZ,
   rmsDb,
+  silenceGateEnvelope,
 } from '../src/audio/dsp';
+import { buildFilterChain, strengthToNrNf } from '../src/audio/ffmpegEngine';
 import { abGains, integratedLoudness } from '../src/audio/loudness';
 import { encodeWav16, parseWavHeader } from '../src/audio/wav';
 import { validateDuration, validateUploadFile } from '../src/audio/validate';
@@ -76,20 +74,18 @@ function pinkish(noise: Float32Array): Float32Array {
   return out;
 }
 
-/** 主 fixture：前 1 秒纯噪声，后 2 秒噪声 + 1 kHz 正弦。 */
-function makeFixture(): { channels: Float32Array[]; noiseOnly: Float32Array[] } {
+/** 主 fixture：3 秒噪声 + 1 kHz 正弦（全程有声）。 */
+function makeFixture(): { channels: Float32Array[] } {
   const noise = pinkish(whiteNoise(3, 0.05, 42));
   const tone = sine(1000, 3, 0.25);
   const mix = new Float32Array(3 * SR);
   for (let i = 0; i < mix.length; i++) {
-    mix[i] = i < SR ? noise[i] : noise[i] + tone[i];
+    mix[i] = noise[i] + tone[i];
   }
-  const noiseOnly = new Float32Array(SR);
-  noiseOnly.set(noise.subarray(0, SR));
   // 双声道：右声道加 0.9 倍，避免完全相同
   const right = new Float32Array(mix.length);
   for (let i = 0; i < mix.length; i++) right[i] = mix[i] * 0.9;
-  return { channels: [mix, right], noiseOnly: [noiseOnly, noiseOnly.slice()] };
+  return { channels: [mix, right] };
 }
 
 /** 静音 fixture：1 秒噪声+音 → 1 秒静音 → 1 秒噪声+音。 */
@@ -99,6 +95,19 @@ function makeSilenceFixture(): Float32Array[] {
   const mix = new Float32Array(3 * SR);
   for (let i = 0; i < mix.length; i++) {
     const inSilence = i >= SR && i < 2 * SR;
+    mix[i] = inSilence ? 0 : noise[i] + tone[i];
+  }
+  return [mix, mix.slice()];
+}
+
+/** 短静音 fixture：1 秒噪声+音 → 100 ms 静音 → 1 秒噪声+音（门不应动作）。 */
+function makeShortSilenceFixture(): Float32Array[] {
+  const noise = pinkish(whiteNoise(2.1, 0.05, 11));
+  const tone = sine(1000, 2.1, 0.25);
+  const n = Math.floor(2.1 * SR);
+  const mix = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const inSilence = i >= SR && i < SR + Math.floor(0.1 * SR);
     mix[i] = inSilence ? 0 : noise[i] + tone[i];
   }
   return [mix, mix.slice()];
@@ -121,81 +130,97 @@ describe('FFT', () => {
   });
 });
 
-describe('降噪 DSP', () => {
-  it('强度 50%：噪声频段降 ≥6 dB，1 kHz 变化 <1 dB', async () => {
+describe('静音门（默认关，v2 只剩这一级 JS 处理）', () => {
+  it('全程有声：输出与输入逐采样相同（门不动有声段）', () => {
     const { channels } = makeFixture();
-    const profile = learnNoiseProfile(channels, SR, 0, 1);
-    const out = await processAudio(channels, SR, {
-      strength: 0.5,
-      highpassHz: HIGHPASS_HZ,
-      noiseProfile: profile,
-    });
-    const before = bandLevels(channels, SR);
-    const after = bandLevels(out, SR);
-    // 频段索引：0 sub, 1 bass, 2 low_mid, 3 mid, 4 presence, 5 brilliance, 6 air
-    // 5–10 kHz（brilliance）基本只有噪声
-    const noiseDrop = before[5] - after[5];
-    expect(noiseDrop).toBeGreaterThanOrEqual(6);
-    // 1 kHz 在 mid（500–2000）段；相对电平变化 <1 dB
-    expect(Math.abs(after[3] - before[3])).toBeLessThan(1);
-  }, 60000);
-
-  it('强度 0：90 Hz 以上频段差 <0.3 dB（只做高通）', async () => {
-    const { channels } = makeFixture();
-    const out = await processAudio(channels, SR, {
-      strength: 0,
-      highpassHz: HIGHPASS_HZ,
-      noiseProfile: null,
-    });
-    const before = bandLevels(channels, SR);
-    const after = bandLevels(out, SR);
-    // 只比 250 Hz 以上频段：90 Hz 高通会动 sub（20–60）与 bass（60–250）段，
-    // 规格写明“高通除外”。
-    for (let b = 2; b < before.length; b++) {
-      expect(Math.abs(after[b] - before[b])).toBeLessThan(0.3);
+    const out = applySilenceGate(channels, SR);
+    // 不逐采样 expect（26 万次断言在并行跑时会被 5 s 默认超时杀掉）：
+    // 先算最大差，再一次断言。
+    let maxDiff = 0;
+    for (let c = 0; c < channels.length; c++) {
+      for (let i = 0; i < channels[c].length; i++) {
+        maxDiff = Math.max(maxDiff, Math.abs(out[c][i] - channels[c][i]));
+      }
     }
-  }, 60000);
+    expect(maxDiff).toBe(0);
+  });
 
-  it('零噪声谱时 STFT 往返：频谱差 <0.5 dB（ISTFT 正确性）', async () => {
-    const { channels } = makeFixture();
-    const zeroProfile = new Float32Array(2048 / 2 + 1);
-    const out = await processAudio(channels, SR, {
-      strength: 1,
-      highpassHz: HIGHPASS_HZ,
-      noiseProfile: zeroProfile,
-    });
-    // 高通会动 sub/bass 段，只比 250 Hz 以上
-    const before = bandLevels(channels, SR);
-    const after = bandLevels(out, SR);
-    for (let b = 2; b < before.length; b++) {
-      expect(Math.abs(after[b] - before[b])).toBeLessThan(0.5);
-    }
-  }, 60000);
-
-  it('无新增削波', async () => {
-    const { channels } = makeFixture();
-    const profile = learnNoiseProfile(channels, SR, 0, 1);
-    const out = await processAudio(channels, SR, {
-      strength: 0.5,
-      highpassHz: HIGHPASS_HZ,
-      noiseProfile: profile,
-    });
-    const met = computeMetrics(channels, out, SR);
-    expect(met.clippedAfter).toBeLessThanOrEqual(met.clippedBefore);
-  }, 60000);
-
-  it('静音段处理后仍 < −50 dBFS（开头 100 ms 不计）', async () => {
+  it('1 秒静音段：包络在段中为 0，淡入淡出各 50 ms（中点约 0.5）', () => {
     const channels = makeSilenceFixture();
-    const profile = learnNoiseProfile(channels, SR, 0, 1);
-    const out = await processAudio(channels, SR, {
-      strength: 0.5,
-      highpassHz: HIGHPASS_HZ,
-      noiseProfile: profile,
-    });
-    const { ok, maxDb } = checkSilence(channels, out, SR);
-    expect(ok).toBe(true);
-    expect(maxDb).toBeLessThan(-50);
-  }, 60000);
+    const env = silenceGateEnvelope(channels, SR);
+    // 检测块 10 ms（441 采样），淡入淡出 50 ms（2205 采样）；
+    // 静音块 100–199，下压起点 (100+10)*441=48510，恢复起点 200*441=88200。
+    expect(env[0]).toBe(1);
+    expect(env[48509]).toBe(1);
+    expect(env[48510 + 1102]).toBeCloseTo(0.5, 2);
+    expect(env[60000]).toBe(0);
+    expect(env[88200]).toBe(0);
+    expect(env[88200 + 1102]).toBeCloseTo(0.5, 2);
+    expect(env[100000]).toBe(1);
+    // 门后静音段中部确实为 0
+    const out = applySilenceGate(channels, SR);
+    expect(out[0][60000]).toBe(0);
+    expect(out[0][1000]).toBe(channels[0][1000]);
+  });
+
+  it('100 ms 短静音：门不动作（要连续 ≥200 ms 才压）', () => {
+    const channels = makeShortSilenceFixture();
+    const env = silenceGateEnvelope(channels, SR);
+    for (let i = 0; i < env.length; i += 1000) {
+      expect(env[i]).toBe(1);
+    }
+    const out = applySilenceGate(channels, SR);
+    let maxDiff = 0;
+    for (let i = 0; i < channels[0].length; i++) {
+      maxDiff = Math.max(maxDiff, Math.abs(out[0][i] - channels[0][i]));
+    }
+    expect(maxDiff).toBe(0);
+  });
+});
+
+describe('滤镜串（FFmpeg afftdn，强度 → nr/nf）', () => {
+  it('强度 0：只做 90 Hz 高通，不进 afftdn', () => {
+    expect(buildFilterChain({ strength: 0 })).toBe('highpass=f=90');
+    expect(strengthToNrNf(0)).toBeNull();
+    expect(strengthToNrNf(-0.5)).toBeNull();
+  });
+
+  it('锚点与插值：0.25/0.5/0.75/1.0 对应 nr 6/12/20/30，nf 全程 −30', () => {
+    expect(strengthToNrNf(0.25)).toEqual({ nr: 6, nf: -30 });
+    expect(strengthToNrNf(0.5)).toEqual({ nr: 12, nf: -30 });
+    expect(strengthToNrNf(0.75)).toEqual({ nr: 20, nf: -30 });
+    expect(strengthToNrNf(1)).toEqual({ nr: 30, nf: -30 });
+    expect(strengthToNrNf(1.5)).toEqual({ nr: 30, nf: -30 });
+    expect(buildFilterChain({ strength: 0.5 })).toBe('highpass=f=90,afftdn=nr=12:nf=-30');
+    expect(buildFilterChain({ strength: 0.25 })).toBe('highpass=f=90,afftdn=nr=6:nf=-30');
+    expect(buildFilterChain({ strength: 0.75 })).toBe('highpass=f=90,afftdn=nr=20:nf=-30');
+    expect(buildFilterChain({ strength: 1 })).toBe('highpass=f=90,afftdn=nr=30:nf=-30');
+    // 0.375 在 0.25–0.5 锚点正中：nr=9，nf=−30
+    expect(buildFilterChain({ strength: 0.375 })).toBe('highpass=f=90,afftdn=nr=9:nf=-30');
+  });
+
+  it('滤镜串不含 sn 采样（出货链不用采样，见 ffmpegEngine.ts 文件头）', () => {
+    for (const s of [0.25, 0.5, 0.75, 1]) {
+      const chain = buildFilterChain({ strength: s });
+      expect(chain).not.toContain('asendcmd');
+      expect(chain).not.toContain('sn start');
+      expect(chain).not.toContain('sn stop');
+    }
+  });
+});
+
+describe('测量辅助', () => {
+  it('同一信号前后对比：噪声底不变、信噪比变化 0、静音通过', () => {
+    const channels = makeSilenceFixture();
+    const met = computeMetrics(channels, channels, SR);
+    expect(met.noiseFloorAfterDb).toBeCloseTo(met.noiseFloorBeforeDb, 6);
+    expect(met.snrChangeDb).toBeCloseTo(0, 6);
+    expect(met.spectralDistanceDb).toBeCloseTo(0, 6);
+    expect(met.clippedAfter).toBe(met.clippedBefore);
+    expect(met.silenceOk).toBe(true);
+    expect(met.silenceMaxDb).toBeLessThan(-50);
+    expect(rmsDb(channels)).toBeGreaterThan(-40);
+  });
 
   it('自动噪声段落在最安静处附近', () => {
     const channels = makeSilenceFixture();
@@ -204,20 +229,6 @@ describe('降噪 DSP', () => {
     expect(q.endSec).toBeGreaterThan(1);
     expect(q.startSec).toBeLessThan(2);
   });
-
-  it('噪声底下降，信噪比提升', async () => {
-    const { channels } = makeFixture();
-    const profile = learnNoiseProfile(channels, SR, 0, 1);
-    const out = await processAudio(channels, SR, {
-      strength: 0.5,
-      highpassHz: HIGHPASS_HZ,
-      noiseProfile: profile,
-    });
-    const met = computeMetrics(channels, out, SR);
-    expect(met.noiseFloorAfterDb).toBeLessThan(met.noiseFloorBeforeDb - 3);
-    expect(met.snrChangeDb).toBeGreaterThan(0);
-    expect(rmsDb(channels)).toBeGreaterThan(-40);
-  }, 60000);
 });
 
 describe('同响度 A/B', () => {
@@ -238,13 +249,7 @@ describe('同响度 A/B', () => {
 describe('WAV 导出', () => {
   it('头字段正确：44.1 kHz、16-bit、双声道、时长一致', async () => {
     const { channels } = makeFixture();
-    const profile = learnNoiseProfile(channels, SR, 0, 1);
-    const out = await processAudio(channels, SR, {
-      strength: 0.5,
-      highpassHz: HIGHPASS_HZ,
-      noiseProfile: profile,
-    });
-    const blob = encodeWav16(out, SR);
+    const blob = encodeWav16(channels, SR);
     const bytes = new Uint8Array(await blob.arrayBuffer());
     const header = parseWavHeader(bytes);
     expect(header).not.toBeNull();
@@ -255,8 +260,8 @@ describe('WAV 导出', () => {
     // 写盘供 ffprobe 实测
     const dir = join(dirname(fileURLToPath(import.meta.url)), 'out');
     mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, 'denoised.wav'), bytes);
-  }, 60000);
+    writeFileSync(join(dir, 'fixture.wav'), bytes);
+  });
 });
 
 describe('上传校验', () => {

@@ -28,6 +28,10 @@ export const copy = {
     errMicDenied: '麦克风权限被拒绝，请在浏览器地址栏允许后重试。',
     errCaptureDenied: '分享被取消了，没开始录制。',
     errGeneric: '录制失败，请重试。',
+    foregroundWarn:
+      '录制时 Suno 标签页与本站标签页都要保持在前台：切到后台会被 Chrome 节流，录音会出现断点。',
+    foregroundWarnMic:
+      '录制时本站标签页要保持在前台：切到后台会被 Chrome 节流，录音会出现断点。',
   },
   workbench: {
     noRecording: '先去“录制”录一首歌，或从录音库打开一首。',
@@ -38,10 +42,14 @@ export const copy = {
     processed: '降噪后',
     sameVolumeNote: '已按相同音量对比',
     strengthLabel: '降噪强度',
-    noiseLabel: '噪声学习段',
-    autoNoise: '自动取最安静的 1 秒',
-    relearn: '重新学习噪声',
-    noiseHint: '拖动波形框选 1–2 秒只有杂音的片段（歌开始前的空隙最好），或用自动。',
+    noiseLabel: '波形',
+    noiseHint: '波形只作显示。降噪引擎用默认噪声谱形，不再需要框选噪声段。',
+    gateLabel: '静音门',
+    gateHint:
+      '默认关。打开后只压全频段 RMS < −60 dBFS 的静音段，淡入淡出 50 ms；有声段完全不动。',
+    engineLoading: '正在加载降噪引擎 FFmpeg afftdn（首次约 25 MB，之后缓存）…',
+    engineReady: '引擎：FFmpeg afftdn（已加载）',
+    engineError: '降噪引擎加载失败：',
     detailsTitle: '处理详情',
     exportWav: '导出干净 WAV',
     exportReport: '下载降噪报告',

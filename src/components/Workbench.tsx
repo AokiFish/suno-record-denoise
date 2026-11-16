@@ -1,11 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import {
-  computeMetrics,
-  findQuietestWindow,
-  learnNoiseProfile,
-  processAudio,
-  HIGHPASS_HZ,
-} from '../audio/dsp';
+import { applySilenceGate, computeMetrics } from '../audio/dsp';
+import { HIGHPASS_HZ, isFfmpegLoaded, processWithFfmpeg } from '../audio/ffmpegEngine';
 import { abGains, integratedLoudness } from '../audio/loudness';
 import { decodeBlob } from '../audio/capture';
 import { getRecordingAudio, getRecordingMeta, updateRecordingMeta } from '../audio/db';
@@ -50,9 +45,9 @@ export default function Workbench(props: {
   const [sampleRate, setSampleRate] = useState(44100);
   const [title, setTitle] = useState('');
   const [strength, setStrength] = useState(0.5);
-  const [noiseStart, setNoiseStart] = useState(0);
-  const [noiseEnd, setNoiseEnd] = useState(1);
-  const [autoNoise, setAutoNoise] = useState(true);
+  const [gateEnabled, setGateEnabled] = useState(false);
+  const [engineStatus, setEngineStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
+  const [engineError, setEngineError] = useState('');
   const [processed, setProcessed] = useState<Float32Array[] | null>(null);
   const [metrics, setMetrics] = useState<DenoiseMetrics | null>(null);
   const [ab, setAb] = useState<{ gainOriginalDb: number; gainProcessedDb: number; diffLu: number } | null>(null);
@@ -100,14 +95,8 @@ export default function Workbench(props: {
       const s = m.settings;
       if (s) {
         setStrength(s.strength);
-        setNoiseStart(s.noiseStartSec);
-        setNoiseEnd(s.noiseEndSec);
-        setAutoNoise(s.autoNoise);
-      } else {
-        const q = findQuietestWindow(decoded.channels, decoded.sampleRate);
-        setNoiseStart(q.startSec);
-        setNoiseEnd(q.endSec);
-        setAutoNoise(true);
+        // 旧库里的设置没有 silenceGate 字段（v1 存的是噪声段），按关处理。
+        setGateEnabled(Boolean(s.silenceGate));
       }
     } catch {
       setLoadError(copy.workbench.noRecording);
@@ -122,22 +111,27 @@ export default function Workbench(props: {
   }, [props.recordingId, load]);
 
   const runProcess = useCallback(
-    async (ch: Float32Array[], sr: number, str: number, ns: number, ne: number) => {
+    async (ch: Float32Array[], sr: number, str: number, gate: boolean) => {
       setProcessing(true);
       setProgress(0);
+      setEngineError('');
+      // wasm 懒加载：只在用户打开工作台、第一次真正降噪时加载；
+      // 核心跑在 ffmpeg.wasm 自带的 Worker 里，不卡 UI。
+      if (!isFfmpegLoaded()) setEngineStatus('loading');
       try {
-        const profile = str > 0 ? learnNoiseProfile(ch, sr, ns, ne) : null;
-        const out = await processAudio(ch, sr, {
+        const { channels: out, sampleRate: outRate } = await processWithFfmpeg(ch, sr, {
           strength: str,
-          highpassHz: HIGHPASS_HZ,
-          noiseProfile: profile,
           onProgress: (p) => setProgress(p),
         });
-        const met = computeMetrics(ch, out, sr);
+        setEngineStatus('ready');
+        // wasm 输出尾部比输入短 1391 采样（31.5 ms），只在尾部；
+        // 头部与中部逐采样对齐，A/B 切换不受影响。
+        const finalOut = gate ? applySilenceGate(out, outRate) : out;
+        const met = computeMetrics(ch, finalOut, sr);
         const lufsOrig = integratedLoudness(ch, sr);
-        const lufsProc = integratedLoudness(out, sr);
+        const lufsProc = integratedLoudness(finalOut, sr);
         const gains = abGains(lufsOrig, lufsProc);
-        setProcessed(out);
+        setProcessed(finalOut);
         setMetrics(met);
         setAb({
           gainOriginalDb: gains.gainAdb,
@@ -148,29 +142,31 @@ export default function Workbench(props: {
         if (meta) {
           const settings: DenoiseSettings = {
             strength: str,
-            noiseStartSec: ns,
-            noiseEndSec: ne,
             highpassHz: HIGHPASS_HZ,
-            autoNoise,
+            silenceGate: gate,
           };
           await updateRecordingMeta(meta.id, { settings, metrics: met });
         }
+      } catch (e) {
+        // 引擎加载或运行失败：如实报错，不许悄悄切回旧引擎（旧引擎已删）。
+        setEngineStatus('error');
+        setEngineError(e instanceof Error ? e.message : String(e));
       } finally {
         setProcessing(false);
         setProgress(1);
       }
     },
-    [meta, autoNoise],
+    [meta],
   );
 
-  // 强度变化后 400 ms 防抖再重算；重算期间上一版仍可播放
+  // 强度/静音门变化后 400 ms 防抖再重算；重算期间上一版仍可播放
   useEffect(() => {
     if (!channels || loading) return;
     const timer = window.setTimeout(() => {
-      void runProcess(channels, sampleRate, strength, noiseStart, noiseEnd);
+      void runProcess(channels, sampleRate, strength, gateEnabled);
     }, 400);
     return () => window.clearTimeout(timer);
-  }, [channels, sampleRate, strength, noiseStart, noiseEnd, loading, runProcess]);
+  }, [channels, sampleRate, strength, gateEnabled, loading, runProcess]);
 
   function ensureCtx(): AudioContext {
     if (!ctxRef.current) {
@@ -348,20 +344,6 @@ export default function Workbench(props: {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  function onSelectNoise(start: number, end: number): void {
-    setNoiseStart(start);
-    setNoiseEnd(end);
-    setAutoNoise(false);
-  }
-
-  function onAutoNoise(): void {
-    if (!channels) return;
-    const q = findQuietestWindow(channels, sampleRate);
-    setNoiseStart(q.startSec);
-    setNoiseEnd(q.endSec);
-    setAutoNoise(true);
-  }
-
   function exportWav(): void {
     if (!processed || !meta) return;
     const blob = encodeWav16(processed, sampleRate);
@@ -373,10 +355,8 @@ export default function Workbench(props: {
     if (!processed || !meta || !metrics || !ab) return;
     const settings: DenoiseSettings = {
       strength,
-      noiseStartSec: noiseStart,
-      noiseEndSec: noiseEnd,
       highpassHz: HIGHPASS_HZ,
-      autoNoise,
+      silenceGate: gateEnabled,
     };
     downloadJson(
       buildReport(meta, settings, metrics, {
@@ -420,23 +400,10 @@ export default function Workbench(props: {
         </p>
       </section>
 
-      <section className="card" aria-label="波形与噪声学习">
+      <section className="card" aria-label="波形">
         <h2>{copy.workbench.noiseLabel}</h2>
         <p>{copy.workbench.noiseHint}</p>
-        <Waveform
-          peaks={peaks}
-          durationSec={durationSec}
-          noiseStartSec={noiseStart}
-          noiseEndSec={noiseEnd}
-          onSelect={onSelectNoise}
-        />
-        <p className="muted">
-          学习段：{noiseStart.toFixed(1)}–{noiseEnd.toFixed(1)} 秒
-          {autoNoise ? '（自动取最安静处）' : '（手动框选）'}
-        </p>
-        <button type="button" className="ghost" onClick={onAutoNoise}>
-          {copy.workbench.autoNoise}
-        </button>
+        <Waveform peaks={peaks} durationSec={durationSec} />
       </section>
 
       <section className="card" aria-label="降噪强度">
@@ -452,6 +419,25 @@ export default function Workbench(props: {
           aria-label={copy.workbench.strengthLabel}
           onChange={(e) => setStrength(Number(e.target.value) / 100)}
         />
+        <label>
+          <input
+            type="checkbox"
+            checked={gateEnabled}
+            onChange={(e) => setGateEnabled(e.target.checked)}
+          />
+          {copy.workbench.gateLabel}
+        </label>
+        <p className="muted">{copy.workbench.gateHint}</p>
+        {engineStatus === 'loading' && (
+          <p aria-live="polite">{copy.workbench.engineLoading}</p>
+        )}
+        {engineStatus === 'ready' && <p className="muted">{copy.workbench.engineReady}</p>}
+        {engineStatus === 'error' && (
+          <p className="error" role="alert">
+            {copy.workbench.engineError}
+            {engineError}
+          </p>
+        )}
         {processing && (
           <div>
             <p aria-live="polite">{copy.workbench.processing}</p>

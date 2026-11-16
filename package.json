@@ -1,1 +1,30 @@
-{"dependencies":{"react":"19.3.1","react-dom":"19.3.1"},"description":"Record your own Suno songs from a browser tab, remove steady background noise, and export a clean WAV for Audio Lab.","devDependencies":{"@types/node":"^24.19.2","@types/react":"19.3.0","@types/react-dom":"19.3.0","@vitejs/plugin-react":"4.7.0","typescript":"5.9.3","vite":"7.3.8","vitest":"4.1.12"},"name":"suno-record-denoise","private":true,"scripts":{"build":"tsc && vite build","check":"tsc --noEmit && npm test && npm run build","dev":"vite","preview":"vite preview","test":"vitest run"},"type":"module","version":"0.1.0"}
+{
+  "dependencies": {
+    "@ffmpeg/core": "^0.11.0",
+    "@ffmpeg/ffmpeg": "^0.11.6",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "description": "Record your own Suno songs from a browser tab, remove steady background noise, and export a clean WAV for Audio Lab.",
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "4.7.0",
+    "typescript": "5.9.3",
+    "vite": "7.3.8",
+    "vitest": "4.1.12"
+  },
+  "name": "suno-record-denoise",
+  "private": true,
+  "scripts": {
+    "build": "tsc && vite build",
+    "check": "tsc --noEmit && npm test && npm run build",
+    "dev": "vite",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "postinstall": "node scripts/fetch-ffmpeg-core.mjs"
+  },
+  "type": "module",
+  "version": "0.1.0"
+}

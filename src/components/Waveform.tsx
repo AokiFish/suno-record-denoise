@@ -4,12 +4,16 @@ interface WaveformProps {
   /** 单声道混合峰值（0..1），每列一个值。 */
   peaks: number[];
   durationSec: number;
-  noiseStartSec: number;
-  noiseEndSec: number;
-  onSelect: (startSec: number, endSec: number) => void;
+  /**
+   * 框选噪声段的旧接口：v2 引擎（FFmpeg afftdn）不再采样，全部可选；
+   * 不传 onSelect 时只显示波形，不可拖动。
+   */
+  noiseStartSec?: number;
+  noiseEndSec?: number;
+  onSelect?: (startSec: number, endSec: number) => void;
 }
 
-/** 波形画布：拖动框选噪声学习段。 */
+/** 波形画布：v2 只作显示。 */
 export default function Waveform(props: WaveformProps): ReactNode {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const dragRef = useRef<{ startX: number; active: boolean }>({ startX: 0, active: false });
@@ -28,11 +32,16 @@ export default function Waveform(props: WaveformProps): ReactNode {
     ctx.clearRect(0, 0, width, height);
     const styles = getComputedStyle(canvas);
     const accent = styles.getPropertyValue('--accent').trim() || '#0a7aff';
-    // 噪声段底色
-    const x0 = (props.noiseStartSec / props.durationSec) * width;
-    const x1 = (props.noiseEndSec / props.durationSec) * width;
-    ctx.fillStyle = 'rgba(10, 122, 255, 0.15)';
-    ctx.fillRect(x0, 0, Math.max(2, x1 - x0), height);
+    // 噪声段底色（v2 不再框选：只有调用方传了起止才画）
+    if (
+      props.noiseStartSec !== undefined &&
+      props.noiseEndSec !== undefined
+    ) {
+      const x0 = (props.noiseStartSec / props.durationSec) * width;
+      const x1 = (props.noiseEndSec / props.durationSec) * width;
+      ctx.fillStyle = 'rgba(10, 122, 255, 0.15)';
+      ctx.fillRect(x0, 0, Math.max(2, x1 - x0), height);
+    }
     // 波形
     ctx.fillStyle = accent;
     const peaks = props.peaks;
@@ -55,20 +64,23 @@ export default function Waveform(props: WaveformProps): ReactNode {
       ref={canvasRef}
       className="waveform"
       role="img"
-      aria-label="波形图，拖动可框选噪声学习段"
+      aria-label="波形图"
       onPointerDown={(e) => {
+        if (!props.onSelect) return;
         dragRef.current = { startX: secFromEvent(e), active: true };
         e.currentTarget.setPointerCapture(e.pointerId);
       }}
       onPointerMove={(e) => {
-        if (!dragRef.current.active) return;
+        if (!dragRef.current.active || !props.onSelect) return;
         const cur = secFromEvent(e);
         const start = Math.min(dragRef.current.startX, cur);
         const end = Math.max(dragRef.current.startX, cur);
         if (end - start >= 0.2) props.onSelect(start, end);
       }}
       onPointerUp={(e) => {
+        if (!dragRef.current.active) return;
         dragRef.current.active = false;
+        if (!props.onSelect) return;
         const cur = secFromEvent(e);
         const start = Math.min(dragRef.current.startX, cur);
         const end = Math.max(dragRef.current.startX, cur);

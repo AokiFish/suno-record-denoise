@@ -1,13 +1,10 @@
 export interface DenoiseSettings {
-  /** 0..1，0.5 为默认。0 = 只做高通，不做谱减法。 */
+  /** 0..1，0.5 为默认。0 = 只做高通，不进 afftdn。 */
   strength: number;
-  /** 噪声学习段（秒），左闭右开。 */
-  noiseStartSec: number;
-  noiseEndSec: number;
   /** 高通截止频率 Hz，固定 90。 */
   highpassHz: number;
-  /** 噪声段是否由“最安静帧”自动选出。 */
-  autoNoise: boolean;
+  /** 静音门开关，默认关。开时只在全频段 RMS < −60 dBFS 的段动作，淡入淡出 50 ms。 */
+  silenceGate: boolean;
 }
 
 export interface DenoiseMetrics {
@@ -38,6 +35,9 @@ export interface RecordingMeta {
   channels: number;
   mimeType: string;
   sizeBytes: number;
+  /** 录制 chunk 统计（断点定位用；上传文件没有）。 */
+  chunkCount?: number;
+  totalBytes?: number;
   settings: DenoiseSettings | null;
   metrics: DenoiseMetrics | null;
 }
@@ -51,11 +51,10 @@ export interface DenoiseReport {
   source: RecordingSource;
   input: { durationSec: number; sampleRate: number; channels: number };
   denoise: {
-    method: 'spectral-subtraction + highpass';
+    method: 'FFmpeg afftdn';
     strength: number;
     highpassHz: number;
-    noiseSegmentSec: [number, number];
-    autoNoise: boolean;
+    silenceGate: boolean;
   };
   metrics: DenoiseMetrics;
   ab: { gainOriginalDb: number; gainProcessedDb: number; loudnessDiffLu: number };

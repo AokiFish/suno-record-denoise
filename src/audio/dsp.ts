@@ -1,101 +1,21 @@
 /**
- * 降噪 DSP：FFT 谱减法（功率域）+ 90 Hz 高通。
- * 全部为纯函数，可在 Node（vitest）里数值测试；不依赖浏览器 API。
+ * v2 测量与辅助 DSP：本文件不再含降噪引擎。
  *
- * 做法：
- * 1. 时域先过二阶 Butterworth 高通（默认 90 Hz），去掉隆隆声。
- * 2. 强度为 0 时到此为止：只做高通，不碰频谱。
- * 3. 强度 > 0 时做 STFT：Hann 窗、帧长 2048、跳 512（75% 重叠），
- *    每频点功率减去 alpha 倍噪声功率，下限为原功率的 1%（最多压 20 dB），
- *    再 ISTFT 重叠相加。帧首尾各补一帧零，避免归一化分母过小导致的
- *    边缘爆音（分母下限钳制）。
+ * 降噪引擎 = FFmpeg afftdn（ffmpeg.wasm 单线程版，见 src/audio/ffmpegEngine.ts）。
+ * v1 的手写谱减法（spectralSubtractChannel / learnNoiseProfile / processAudio）
+ * 已删除，不留作备选。
+ *
+ * 本文件只剩纯函数（可在 Node/vitest 里数值测试，不依赖浏览器 API）：
+ * - 测量：bandLevels / rmsDb / noiseFloorDb / countClipped / truePeakDbTp /
+ *   checkSilence / computeMetrics（前后指标对比用）。
+ * - 辅助：findQuietestWindow（自动噪声段）、silenceGateEnvelope + applySilenceGate
+ *   （静音门，默认关；开时只在全频段 RMS < −60 dBFS 的段动作，淡入淡出 50 ms）、
+ *   resampleLinear（wav.ts 用）。
  */
-import { fftForward, fftInverse, hannWindow } from './fft';
+import { fftForward, hannWindow } from './fft';
 import type { DenoiseMetrics } from './types';
 
-export const FFT_SIZE = 2048;
-export const HOP_SIZE = 512;
-export const HIGHPASS_HZ = 90;
-
 const BAND_EDGES_HZ = [20, 60, 250, 500, 2000, 5000, 10000, 20000];
-
-/** RBJ 二阶高通滤波器系数。 */
-function highpassCoefficients(freqHz: number, sampleRate: number): { b: number[]; a: number[] } {
-  const w0 = (2 * Math.PI * freqHz) / sampleRate;
-  const alpha = Math.sin(w0) / (2 * 0.7071);
-  const cos = Math.cos(w0);
-  const a0 = 1 + alpha;
-  return {
-    b: [((1 + cos) / 2 / a0), (-(1 + cos) / a0), ((1 + cos) / 2 / a0)],
-    a: [1, ((-2 * cos) / a0), ((1 - alpha) / a0)],
-  };
-}
-
-export function applyHighpass(samples: Float32Array, sampleRate: number, freqHz: number): Float32Array {
-  const { b, a } = highpassCoefficients(freqHz, sampleRate);
-  const out = new Float32Array(samples.length);
-  let x1 = 0;
-  let x2 = 0;
-  let y1 = 0;
-  let y2 = 0;
-  for (let i = 0; i < samples.length; i++) {
-    const x0 = samples[i];
-    const y0 = b[0] * x0 + b[1] * x1 + b[2] * x2 - a[1] * y1 - a[2] * y2;
-    out[i] = y0;
-    x2 = x1;
-    x1 = x0;
-    y2 = y1;
-    y1 = y0;
-  }
-  return out;
-}
-
-/**
- * 从 [startSec, endSec) 段学习噪声谱：只用完全落在段内的帧，
- * 每频点取功率中位数（抗音乐漏入）。返回每频点功率（0..fftSize/2）。
- */
-export function learnNoiseProfile(
-  channels: Float32Array[],
-  sampleRate: number,
-  startSec: number,
-  endSec: number,
-  fftSize: number = FFT_SIZE,
-): Float32Array {
-  const start = Math.floor(startSec * sampleRate);
-  const end = Math.floor(endSec * sampleRate);
-  const bins = fftSize / 2 + 1;
-  const window = hannWindow(fftSize);
-  const re = new Float32Array(fftSize);
-  const im = new Float32Array(fftSize);
-  const powers: number[][] = Array.from({ length: bins }, () => []);
-  for (let ch = 0; ch < channels.length; ch++) {
-    const data = channels[ch];
-    for (let pos = start; pos + fftSize <= end; pos += HOP_SIZE) {
-      for (let i = 0; i < fftSize; i++) {
-        re[i] = data[pos + i] * window[i];
-        im[i] = 0;
-      }
-      fftForward(re, im);
-      for (let k = 0; k < bins; k++) {
-        powers[k].push(re[k] * re[k] + im[k] * im[k]);
-      }
-    }
-  }
-  const profile = new Float32Array(bins);
-  // 周期图功率服从指数分布，中位数 = 均值 × ln2；除以 ln2 得到均值噪声功率
-  // 的无偏估计（只用中位数会系统性低估，导致谱减法减得不够）。
-  const medianToMean = 1 / Math.LN2;
-  for (let k = 0; k < bins; k++) {
-    const arr = powers[k];
-    if (arr.length === 0) {
-      profile[k] = 0;
-      continue;
-    }
-    arr.sort((a, b) => a - b);
-    profile[k] = arr[Math.floor(arr.length / 2)] * medianToMean;
-  }
-  return profile;
-}
 
 /** 找 RMS 最低的 1 秒窗口（自动噪声段用）。 */
 export function findQuietestWindow(
@@ -123,88 +43,18 @@ export function findQuietestWindow(
   return { startSec: bestStart / sampleRate, endSec: (bestStart + win) / sampleRate };
 }
 
-function spectralSubtractChannel(
-  input: Float32Array,
-  profile: Float32Array,
-  alpha: number,
-  fftSize: number,
-  onProgress?: (p: number) => void,
-): Float32Array {
-  const hop = fftSize / 4;
-  const bins = fftSize / 2 + 1;
-  const window = hannWindow(fftSize);
-  const paddedLen = input.length + 2 * fftSize;
-  const padded = new Float32Array(paddedLen);
-  padded.set(input, fftSize);
-  const out = new Float32Array(paddedLen);
-  const norm = new Float32Array(paddedLen);
-  const re = new Float32Array(fftSize);
-  const im = new Float32Array(fftSize);
-  const frameCount = Math.max(1, Math.floor((paddedLen - fftSize) / hop) + 1);
-  const floorRatio = 0.01; // 每频点最多压 20 dB
-  for (let f = 0; f < frameCount; f++) {
-    const pos = f * hop;
-    for (let i = 0; i < fftSize; i++) {
-      re[i] = padded[pos + i] * window[i];
-      im[i] = 0;
-    }
-    fftForward(re, im);
-    // 每频点增益：功率减法，下限为原功率的 1%（最多压 20 dB）。
-    // 增益再做 ±2 bins 平滑：抑制“音乐噪声”，同时缩短等效滤波器
-    // 的时域拖尾，减少 STFT 预回声（静音段尾部被后面声音污染）。
-    const gain = new Float32Array(bins);
-    for (let k = 0; k < bins; k++) {
-      const power = re[k] * re[k] + im[k] * im[k];
-      const target = Math.max(power - alpha * profile[k], floorRatio * power);
-      gain[k] = power > 1e-18 ? Math.sqrt(target / power) : 0;
-    }
-    const smooth = new Float32Array(bins);
-    for (let k = 0; k < bins; k++) {
-      let sum = 0;
-      let count = 0;
-      for (let j = Math.max(0, k - 2); j <= Math.min(bins - 1, k + 2); j++) {
-        sum += gain[j];
-        count++;
-      }
-      smooth[k] = sum / count;
-    }
-    for (let k = 0; k < bins; k++) {
-      re[k] *= smooth[k];
-      im[k] *= smooth[k];
-      if (k > 0 && k < fftSize / 2) {
-        re[fftSize - k] = re[k];
-        im[fftSize - k] = -im[k];
-      }
-    }
-    fftInverse(re, im);
-    for (let i = 0; i < fftSize; i++) {
-      out[pos + i] += re[i] * window[i];
-      norm[pos + i] += window[i] * window[i];
-    }
-    if (onProgress && f % 64 === 0) onProgress(f / frameCount);
-  }
-  const result = new Float32Array(input.length);
-  for (let i = 0; i < input.length; i++) {
-    const denom = norm[i + fftSize];
-    result[i] = denom > 1e-6 ? out[i + fftSize] / denom : 0;
-  }
-  return result;
-}
-
 /**
- * 静音门（silence gate）：处理链的最后一级。
+ * 静音门（silence gate）包络：处理链的最后一级，可选。
  * 输入中 RMS < −60 dBFS 的静音段（连续 ≥200 ms），在段首留 100 ms
- *（滤波器衰减尾，G8 同款口径）后把输出压到 0，段尾用 10 ms 淡入
- * 恢复——代价是静音后恢复的声音前 10 ms 有淡入，实际听感可忽略。
- * 作用：STFT 预回声会把恢复的声音向静音尾部拖约一帧（46 ms），
- * 门把它拦住；静音段内部本来就该是静音，门只按输入的静音图动作，
- * 不碰任何有声段。没有这级门，1 秒静音段的尾部 100 ms 块会测到
- * 约 −45 dBFS；有门则为数字静音。
+ *（滤波器衰减尾，G8 同款口径）后把输出压到 0，段尾用 50 ms 淡入恢复。
+ * 50 ms 的淡入淡出长于 50 Hz 一个周期（20 ms），不会把低频首波切出咔哒声；
+ * v1 的 10 ms 太短，已改掉。门只按输入的静音图动作，不碰任何有声段。
  */
 export function silenceGateEnvelope(channels: Float32Array[], sampleRate: number): Float32Array {
   const n = channels[0].length;
   const env = new Float32Array(n).fill(1);
-  const blockLen = Math.max(1, Math.floor(0.01 * sampleRate)); // 10 ms
+  const blockLen = Math.max(1, Math.floor(0.01 * sampleRate)); // 10 ms 检测块
+  const fadeLen = Math.max(1, Math.floor(0.05 * sampleRate)); // 50 ms 淡入淡出
   const nBlocks = Math.ceil(n / blockLen);
   const silent: boolean[] = [];
   for (let b = 0; b < nBlocks; b++) {
@@ -229,15 +79,15 @@ export function silenceGateEnvelope(channels: Float32Array[], sampleRate: number
     while (e < nBlocks && silent[e]) e++;
     if (e - b >= 20) {
       const downStart = (b + 10) * blockLen;
-      const downEnd = downStart + blockLen;
+      const downEnd = Math.min(n, downStart + fadeLen);
       const upStart = e * blockLen;
-      const upEnd = Math.min(n, upStart + blockLen);
-      for (let i = downStart; i < downEnd && i < n; i++) {
-        env[i] = 1 - (i - downStart) / blockLen;
+      const upEnd = Math.min(n, upStart + fadeLen);
+      for (let i = downStart; i < downEnd; i++) {
+        env[i] = 1 - (i - downStart) / fadeLen;
       }
       for (let i = downEnd; i < upStart && i < n; i++) env[i] = 0;
       for (let i = upStart; i < upEnd; i++) {
-        env[i] = (i - upStart) / blockLen;
+        env[i] = (i - upStart) / fadeLen;
       }
     }
     b = e;
@@ -245,44 +95,14 @@ export function silenceGateEnvelope(channels: Float32Array[], sampleRate: number
   return env;
 }
 
-export interface ProcessOptions {
-  strength: number; // 0..1
-  highpassHz: number;
-  noiseProfile: Float32Array | null;
-  fftSize?: number;
-  onProgress?: (p: number) => void;
-}
-
-/**
- * 完整处理链：高通 →（强度 > 0 时）谱减法。
- * 同步跑完一个声道约几毫秒到几十毫秒；多声道分片跑，onProgress 回调进度。
- * 强度 0 时只做高通，原样返回频谱（测试断言 <0.3 dB 的依据）。
- */
-export async function processAudio(
-  channels: Float32Array[],
-  sampleRate: number,
-  opts: ProcessOptions,
-): Promise<Float32Array[]> {
-  const fftSize = opts.fftSize ?? FFT_SIZE;
-  const alpha = opts.strength * 2;
-  const gate = silenceGateEnvelope(channels, sampleRate);
-  const out: Float32Array[] = [];
-  for (let ch = 0; ch < channels.length; ch++) {
-    const hp = applyHighpass(channels[ch], sampleRate, opts.highpassHz);
-    let result: Float32Array;
-    if (opts.strength <= 0 || !opts.noiseProfile) {
-      result = hp;
-    } else {
-      result = spectralSubtractChannel(hp, opts.noiseProfile, alpha, fftSize, (p) =>
-        opts.onProgress?.((ch + p) / channels.length),
-      );
-    }
-    for (let i = 0; i < result.length; i++) result[i] *= gate[i];
-    out.push(result);
-    // 让出主线程，保持进度条与播放不卡死
-    await new Promise((resolve) => setTimeout(resolve, 0));
-  }
-  return out;
+/** 对全部声道应用静音门包络（按输入信号的静音图；输出一份新数组）。 */
+export function applySilenceGate(channels: Float32Array[], sampleRate: number): Float32Array[] {
+  const env = silenceGateEnvelope(channels, sampleRate);
+  return channels.map((ch) => {
+    const out = new Float32Array(ch.length);
+    for (let i = 0; i < ch.length; i++) out[i] = ch[i] * env[i];
+    return out;
+  });
 }
 
 /** 7 个频段的平均能量（dB，相对整体 RMS），频段同 Audio Lab docs/02。 */
